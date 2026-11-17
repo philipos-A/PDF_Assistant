@@ -3,7 +3,7 @@ import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
 
 // The browser only ever talks to /api on the Vite origin; Vite forwards it to
-// the FastAPI backend, so the Anthropic key never reaches the frontend.
+// the Rust backend, so the Anthropic key never reaches the frontend.
 export default defineConfig({
   plugins: [react(), tailwindcss()],
   server: {
