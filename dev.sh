@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# Start the FastAPI backend (port 8000) and the Vite frontend (port 5173).
+# Start the Rust backend (port 8000) and the Vite frontend (port 5173).
 # Ctrl-C stops both.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-if [ ! -x backend/.venv/bin/uvicorn ]; then
-  echo "Backend not set up. Run: make setup" >&2
+if ! command -v cargo >/dev/null; then
+  echo "Rust is not installed. See https://rustup.rs" >&2
   exit 1
 fi
 if [ ! -d frontend/node_modules ]; then
@@ -18,7 +18,7 @@ fi
 
 trap 'kill 0' EXIT INT TERM
 
-(cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000) &
+(cd backend && cargo run --release) &
 (cd frontend && npm run dev -- --port 5173 --strictPort) &
 
 echo

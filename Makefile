@@ -1,11 +1,9 @@
-PYTHON ?= python3
+.PHONY: setup setup-backend setup-frontend dev backend frontend test lint build
 
-.PHONY: setup setup-backend setup-frontend dev backend frontend test build
-
-setup: setup-backend setup-frontend ## Install backend and frontend dependencies
+setup: setup-backend setup-frontend ## Fetch/build backend crates and install npm deps
 
 setup-backend:
-	cd backend && $(PYTHON) -m venv .venv && .venv/bin/pip install -U pip && .venv/bin/pip install -r requirements.txt
+	cd backend && cargo build --release
 	@test -f backend/.env || (cp backend/.env.example backend/.env && echo "Created backend/.env: add your ANTHROPIC_API_KEY")
 
 setup-frontend:
@@ -15,13 +13,17 @@ dev: ## Run backend and frontend together
 	./dev.sh
 
 backend:
-	cd backend && .venv/bin/uvicorn app.main:app --reload --port 8000
+	cd backend && cargo run --release
 
 frontend:
 	cd frontend && npm run dev
 
-test: ## Run backend tests
-	cd backend && .venv/bin/pytest -q
+test: ## Run backend tests (Claude is mocked; no API calls)
+	cd backend && cargo test
 
-build: ## Type-check and build the frontend
+lint:
+	cd backend && cargo clippy --all-targets -- -D warnings && cargo fmt --check
+
+build: ## Release-build the backend and production-build the frontend
+	cd backend && cargo build --release
 	cd frontend && npm run build

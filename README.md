@@ -38,7 +38,7 @@ you can click to jump to, and render math with KaTeX.
 └──────────────────────────────────────┬────────────────────────────────────────────┘
                                        │  /api/*  (Vite dev proxy, same origin)
                                        ▼
-┌──────────────────────── FastAPI backend (localhost:8000) ─────────────────────────┐
+┌──────────────────── Rust backend: axum (localhost:8000) ──────────────────────────┐
 │  POST /api/documents  → validate → backend/storage/<doc_id>.pdf (+ .json meta)    │
 │  GET  /api/documents/{id}[/file]                                                  │
 │  POST /api/chat       → system prompt + [PDF document block, cache_control]       │
@@ -48,7 +48,7 @@ you can click to jump to, and render math with KaTeX.
 │                                                                                   │
 │  ANTHROPIC_API_KEY lives only in backend/.env                                     │
 └──────────────────────────────────────┬────────────────────────────────────────────┘
-                                       │  anthropic Python SDK (streaming)
+                                       │  reqwest → POST /v1/messages (stream: true)
                                        ▼
                                Claude API (Messages)
 ```
@@ -66,6 +66,11 @@ you can click to jump to, and render math with KaTeX.
 4. The answer streams back as SSE. The `done` event includes token usage,
    including `cache_read_input_tokens`, so you can confirm caching is working.
 
+Anthropic has no official Rust SDK, so the backend calls the Messages API
+directly over HTTP (`anthropic-version: 2026-10-21`) and parses the
+streamed response itself. Rate-limit, overload and server errors are retried
+up to twice before any output has streamed, honouring `retry-after`.
+
 The default model is `claude-sonnet-5-5` with effort `medium`. If a safety
 classifier declines a request, the server-side fallback (`fallbacks: "default"`)
 re-runs it on a suitable fallback model in the same stream. Answers served by
@@ -73,7 +78,7 @@ the fallback are labelled in the UI. Set `ENABLE_FALLBACKS=false` to turn this o
 
 ## Setup
 
-**Requirements:** Python 3.11+, Node.js 20+, and an Anthropic API key.
+**Requirements:** Rust 1.88+ ([rustup.rs](https://rustup.rs)), Node.js 20+, and an Anthropic API key.
 
 ### 1. Get an Anthropic API key
 
@@ -84,7 +89,7 @@ the fallback are labelled in the UI. Set `ENABLE_FALLBACKS=false` to turn this o
 ### 2. Install
 
 ```bash
-make setup                # creates backend/.venv, installs Python + npm deps,
+make setup                # builds the Rust backend, installs npm deps,
                           # and copies backend/.env.example to backend/.env
 ```
 
@@ -100,8 +105,7 @@ ANTHROPIC_API_KEY=sk-ant-...
 ```bash
 # Backend
 cd backend
-python3 -m venv .venv
-.venv/bin/pip install -r requirements.txt
+cargo build --release
 cp .env.example .env      # then add your key
 
 # Frontend
@@ -123,8 +127,9 @@ Open <http://localhost:5173>. The backend runs on <http://localhost:8000>
 ### Tests and build
 
 ```bash
-make test                 # backend pytest suite (Anthropic client is mocked; no API calls)
-make build                # frontend type-check + production build
+make test                 # cargo test: unit tests + API tests against a mock Claude server
+make lint                 # clippy + rustfmt check
+make build                # release backend binary + frontend production build
 ```
 
 ## Configuration (`backend/.env`)
@@ -140,18 +145,22 @@ make build                # frontend type-check + production build
 | `MAX_PAGES`         | `600`                                         | Page limit (Claude's maximum for PDFs).                      |
 | `STORAGE_DIR`       | `storage`                                     | Where uploaded PDFs are kept, relative to `backend/`.        |
 | `CORS_ORIGINS`      | `http://localhost:5173,http://127.0.0.1:5173` | Allowed browser origins if you call the API directly.        |
+| `HOST` / `PORT`     | `127.0.0.1` / `8000`                          | Address the backend listens on.                              |
+| `ANTHROPIC_BASE_URL`| `https://api.anthropic.com`                   | Send requests to a proxy or mock server instead.             |
+| `RUST_LOG`          | `info`                                        | Log filter, e.g. `debug`.                                    |
 
 ## Project layout
 
 ```
-backend/
-  app/main.py             FastAPI app, CORS, routers
-  app/config.py           settings from env / .env
-  app/storage.py          PDF + metadata storage on disk
-  app/prompts.py          system prompt and reader-context builder
-  app/claude.py           message building, streaming, error mapping
-  app/routes/             health, documents, chat
-  tests/                  pytest suite with a fake Anthropic client
+backend/                  Rust crate (axum + tokio + reqwest)
+  src/main.rs             entry point: load settings, bind, serve
+  src/lib.rs              router, CORS, body limits, shared state
+  src/config.rs           settings from env / .env
+  src/storage.rs          PDF + metadata storage on disk
+  src/prompts.rs          system prompt and reader-context builder
+  src/claude.rs           message building, HTTP call, SSE parsing, retries, error mapping
+  src/routes.rs           health, documents, chat handlers
+  tests/api.rs            API tests against a local mock Claude server
 frontend/
   src/App.tsx             layout, resizable/collapsible chat, doc restore
   src/components/         PdfViewer, ChatPanel, Message, MicButton, UploadView, …
@@ -175,6 +184,12 @@ frontend/
   access requires `localhost` or HTTPS.
 - **Read-aloud** uses the browser's built-in voices. Equations are announced as
   "equation shown on screen" rather than read symbol by symbol.
+- **No official Rust SDK:** new API features have to be added by hand in
+  `src/claude.rs`, rather than arriving with an SDK update.
+- **Password-protected PDFs** are rejected at upload, including ones that only
+  restrict printing or copying.
+- **No hot reload** for the backend: restart `make dev` after changing Rust
+  code, or install `cargo-watch` and run `cargo watch -x run` in `backend/`.
 - **Storage** is a local folder with no authentication or cleanup, so it's meant
   for single-user local use. Chat history lives in the browser tab and is cleared
   on reload. The open document is restored after a reload.
