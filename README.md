@@ -170,9 +170,10 @@ frontend/
 
 ## Known limitations
 
-- **Claude's PDF limits:** a request can be at most **32 MB** and a PDF at most
-  **600 pages**. Base64 encoding adds about 33%, so the upload limit defaults to
-  24 MB. Very long or image-heavy papers also use many input tokens per question,
+- **Claude's PDF limits:** a request can be at most **128 MB** and a PDF at most
+  **600 pages** (100 on models with smaller context windows). Base64 encoding adds
+  about 33%, so the default 24 MB upload limit becomes about 32 MB per request;
+  raise `MAX_UPLOAD_MB` if you need larger files. Very long or image-heavy papers also use many input tokens per question,
   and only the first one within a cache window pays full price.
 - **Scanned PDFs** without a text layer can't be highlighted in the viewer.
   Claude can still read them, because it sees each page as an image.
