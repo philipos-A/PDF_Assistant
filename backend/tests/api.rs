@@ -487,6 +487,39 @@ async fn chat_reports_fallback_and_mid_stream_errors() {
 }
 
 #[tokio::test]
+async fn chat_done_names_fallback_model_after_mid_answer_switch() {
+    let stream = [
+        sse("message_start", json!({"type": "message_start", "message": {"model": "claude-sonnet-5-5", "usage": {}}})),
+        sse("content_block_start", json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})),
+        sse("content_block_delta", json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Partial"}})),
+        sse("content_block_start", json!({"type": "content_block_start", "index": 1, "content_block": {"type": "fallback", "from": {"model": "claude-sonnet-5-5"}, "to": {"model": "claude-sonnet-5"}}})),
+        sse("content_block_start", json!({"type": "content_block_start", "index": 2, "content_block": {"type": "text", "text": ""}})),
+        sse("content_block_delta", json!({"type": "content_block_delta", "index": 2, "delta": {"type": "text_delta", "text": "Answer"}})),
+        sse("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}})),
+        sse("message_stop", json!({"type": "message_stop"})),
+    ]
+    .concat();
+    let (url, _) =
+        mock_claude(move |_| (StatusCode::OK, "text/event-stream", stream.clone())).await;
+    let (app, _dir) = test_app(&url, "test-key");
+    let doc_id = upload(&app, 1).await;
+    let (_, _, body) = send(
+        &app,
+        json_post(
+            "/api/chat",
+            json!({"doc_id": doc_id, "question": "hi", "current_page": 1}),
+        ),
+    )
+    .await;
+    let events = parse_sse(&body);
+    let done = events
+        .iter()
+        .find(|(e, _)| e == "done")
+        .expect("done event");
+    assert_eq!(done.1["model"], "claude-sonnet-5");
+}
+
+#[tokio::test]
 async fn chat_retries_transient_errors_then_succeeds() {
     let (url, rec) = mock_claude(|n| {
         if n == 1 {

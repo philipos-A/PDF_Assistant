@@ -70,6 +70,7 @@ export async function streamChat(req: ChatRequest, handlers: StreamHandlers, sig
   let finished = false;
 
   const dispatch = (raw: string) => {
+    if (finished) return;
     let event = "message";
     const data: string[] = [];
     for (const line of raw.split("\n")) {
@@ -77,7 +78,14 @@ export async function streamChat(req: ChatRequest, handlers: StreamHandlers, sig
       else if (line.startsWith("data:")) data.push(line.slice(5).trimStart());
     }
     if (!data.length) return;
-    const payload = JSON.parse(data.join("\n"));
+    let payload;
+    try {
+      payload = JSON.parse(data.join("\n"));
+    } catch {
+      finished = true;
+      handlers.onError("The server sent a response the app couldn't read.");
+      return;
+    }
     switch (event) {
       case "status":
         handlers.onStatus?.(payload.state);

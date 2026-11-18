@@ -118,6 +118,20 @@ impl Settings {
     }
 
     pub fn max_upload_bytes(&self) -> usize {
-        (self.max_upload_mb * 1024 * 1024) as usize
+        usize::try_from(self.max_upload_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn huge_upload_limit_does_not_overflow() {
+        let s = Settings {
+            max_upload_mb: u64::MAX,
+            ..Settings::default()
+        };
+        assert_eq!(s.max_upload_bytes(), usize::MAX);
     }
 }

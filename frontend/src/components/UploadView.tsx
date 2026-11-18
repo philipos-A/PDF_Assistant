@@ -18,7 +18,8 @@ export function UploadView({ health, onUploaded }: Props) {
   const handleFile = async (file: File | undefined) => {
     if (!file) return;
     setError(null);
-    if (file.type !== "application/pdf" && !file.name.toLowerCase().endsWith(".pdf")) {
+    // Match the backend, which requires a .pdf filename.
+    if (!file.name.toLowerCase().endsWith(".pdf")) {
       setError("That file isn't a PDF.");
       return;
     }

@@ -288,13 +288,7 @@ fn sse_frames(
         let mut pending: Vec<u8> = Vec::new();
         while let Some(chunk) = bytes.next().await {
             pending.extend_from_slice(&chunk?);
-            // Only decode complete UTF-8; keep a split multi-byte char for the next chunk.
-            let valid = match std::str::from_utf8(&pending) {
-                Ok(_) => pending.len(),
-                Err(e) => e.valid_up_to(),
-            };
-            buf.push_str(&String::from_utf8_lossy(&pending[..valid]).replace("\r\n", "\n"));
-            pending.drain(..valid);
+            buf.push_str(&decode_utf8_prefix(&mut pending).replace("\r\n", "\n"));
             while let Some(idx) = buf.find("\n\n") {
                 let frame: String = buf.drain(..idx + 2).collect();
                 if let Some(parsed) = parse_frame(&frame) {
@@ -304,6 +298,35 @@ fn sse_frames(
         }
         if let Some(parsed) = parse_frame(&buf) {
             yield parsed;
+        }
+    }
+}
+
+/// Decode and remove everything from `pending` except a trailing, still-incomplete
+/// multi-byte char (kept for the next chunk). Invalid bytes become U+FFFD.
+fn decode_utf8_prefix(pending: &mut Vec<u8>) -> String {
+    let mut out = String::new();
+    loop {
+        match std::str::from_utf8(pending) {
+            Ok(s) => {
+                out.push_str(s);
+                pending.clear();
+                return out;
+            }
+            Err(e) => {
+                let valid = e.valid_up_to();
+                out.push_str(std::str::from_utf8(&pending[..valid]).expect("valid prefix"));
+                match e.error_len() {
+                    Some(bad) => {
+                        out.push('\u{FFFD}');
+                        pending.drain(..valid + bad);
+                    }
+                    None => {
+                        pending.drain(..valid);
+                        return out;
+                    }
+                }
+            }
         }
     }
 }
@@ -362,6 +385,11 @@ pub fn stream_answer(
                     usage.merge(v.pointer("/message/usage"));
                 }
                 "content_block_start" => {
+                    // After a mid-answer fallback, message_start still names the
+                    // requested model; the fallback block names the one now answering.
+                    if let Some(m) = v.pointer("/content_block/to/model").and_then(Value::as_str) {
+                        model = m.to_string();
+                    }
                     let state = match v.pointer("/content_block/type").and_then(Value::as_str) {
                         Some("thinking") => Some("thinking"),
                         Some("fallback") => Some("fallback"),
@@ -457,5 +485,37 @@ mod tests {
             Some(("delta".into(), "a\nb".into()))
         );
         assert_eq!(parse_frame(": keep-alive\n\n"), None);
+    }
+
+    async fn frames_of(chunks: Vec<&'static [u8]>) -> Vec<(String, String)> {
+        let input = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<_, reqwest::Error>(bytes::Bytes::from_static(c))),
+        );
+        sse_frames(input).map(|f| f.expect("frame")).collect().await
+    }
+
+    #[tokio::test]
+    async fn sse_frames_survive_invalid_utf8() {
+        let got = frames_of(vec![
+            b"event: delta\ndata: a\xff\n\n",
+            b"event: delta\ndata: b\n\n",
+        ])
+        .await;
+        assert_eq!(
+            got,
+            vec![
+                ("delta".to_string(), "a\u{fffd}".to_string()),
+                ("delta".to_string(), "b".to_string()),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn sse_frames_join_split_multibyte_chars() {
+        // "é" is 0xC3 0xA9, split across two chunks.
+        let got = frames_of(vec![b"event: delta\ndata: caf\xc3", b"\xa9\n\n"]).await;
+        assert_eq!(got, vec![("delta".to_string(), "café".to_string())]);
     }
 }

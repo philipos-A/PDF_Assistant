@@ -1,4 +1,4 @@
-//! PDF Assistant backend: FastAPI-compatible API implemented with axum.
+//! PDF Assistant backend: HTTP API implemented with axum.
 
 pub mod claude;
 pub mod config;
@@ -50,7 +50,10 @@ pub fn app(state: AppState) -> Router {
 
     // Leave headroom over the file limit for multipart framing; the handler
     // enforces the exact limit with a clear error.
-    let upload_limit = state.settings.max_upload_bytes() + 1024 * 1024;
+    let upload_limit = state
+        .settings
+        .max_upload_bytes()
+        .saturating_add(1024 * 1024);
 
     Router::new()
         .route("/api/health", get(routes::health))
