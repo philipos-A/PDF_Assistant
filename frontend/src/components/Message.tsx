@@ -56,9 +56,9 @@ export const Message = memo(function Message({ message, pageCount, onPageClick, 
   if (message.role === "user") {
     return (
       <div className="flex flex-col items-end gap-1.5">
-        {message.selectedText && (
+        {message.context?.selected_text && (
           <blockquote className="max-w-[90%] border-l-2 border-indigo-400 pl-2 text-xs italic text-slate-500 line-clamp-3 dark:text-slate-400">
-            “{message.selectedText}”
+            “{message.context.selected_text}”
           </blockquote>
         )}
         <div className="max-w-[90%] whitespace-pre-wrap rounded-2xl rounded-br-md bg-indigo-600 px-3.5 py-2 text-sm text-white">

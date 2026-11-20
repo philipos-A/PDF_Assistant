@@ -1,5 +1,7 @@
 //! System prompt and per-question reader context.
 
+use serde::Deserialize;
+
 pub const SYSTEM_PROMPT: &str = "\
 You are a patient reading companion helping someone work through a dense \
 technical or academic paper. The full paper is attached as a PDF at the start \
@@ -30,50 +32,91 @@ looking at.
 as needed. Use short paragraphs, and lists where they help.
 ";
 
-/// Describe where the reader is, to prepend to their question.
-pub fn build_reader_context(
-    current_page: u32,
-    visible_pages: &[u32],
-    selected_text: Option<&str>,
-    page_count: Option<usize>,
-) -> String {
-    let mut lines = vec![match page_count {
-        Some(n) => format!("Current page: {current_page} of {n}"),
-        None => format!("Current page: {current_page}"),
-    }];
+/// Where the reader is when they ask a question: the page they're on, the pages on
+/// screen, and any text they've selected (with the page it came from).
+#[derive(Clone, Debug, Default, Deserialize)]
+pub struct ReaderContext {
+    pub current_page: u32,
+    #[serde(default)]
+    pub visible_pages: Vec<u32>,
+    #[serde(default)]
+    pub selected_text: Option<String>,
+    #[serde(default)]
+    pub selection_page: Option<u32>,
+}
 
-    let mut pages: Vec<u32> = visible_pages.iter().copied().filter(|&p| p > 0).collect();
-    pages.sort_unstable();
-    pages.dedup();
-    if !pages.is_empty() {
-        let list: Vec<String> = pages.iter().map(u32::to_string).collect();
-        lines.push(format!("Pages visible on screen: {}", list.join(", ")));
+impl ReaderContext {
+    /// The `<reader_context>` block prepended to the question. Deterministic, so earlier
+    /// turns rebuild byte-for-byte and the prompt cache keeps hitting.
+    pub fn render(&self, page_count: Option<usize>) -> String {
+        let page = self.current_page;
+        let mut lines = vec![match page_count {
+            Some(n) => format!("Current page: {page} of {n}"),
+            None => format!("Current page: {page}"),
+        }];
+
+        let mut pages: Vec<u32> = self
+            .visible_pages
+            .iter()
+            .copied()
+            .filter(|&p| p > 0)
+            .collect();
+        pages.sort_unstable();
+        pages.dedup();
+        if !pages.is_empty() {
+            let list: Vec<String> = pages.iter().map(u32::to_string).collect();
+            lines.push(format!("Pages visible on screen: {}", list.join(", ")));
+        }
+
+        if let Some(sel) = self
+            .selected_text
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        {
+            let source = match self.selection_page.filter(|&p| p > 0) {
+                Some(p) => format!(" on page {p}"),
+                None => String::new(),
+            };
+            lines.push(format!(
+                "Text the reader has selected{source}:\n<selection>\n{sel}\n</selection>"
+            ));
+        }
+
+        format!("<reader_context>\n{}\n</reader_context>", lines.join("\n"))
     }
-
-    if let Some(sel) = selected_text.map(str::trim).filter(|s| !s.is_empty()) {
-        lines.push(format!(
-            "Text the reader has selected:\n<selection>\n{sel}\n</selection>"
-        ));
-    }
-
-    format!("<reader_context>\n{}\n</reader_context>", lines.join("\n"))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn ctx(page: u32, visible: &[u32], sel: Option<&str>, sel_page: Option<u32>) -> ReaderContext {
+        ReaderContext {
+            current_page: page,
+            visible_pages: visible.to_vec(),
+            selected_text: sel.map(str::to_string),
+            selection_page: sel_page,
+        }
+    }
+
     #[test]
     fn context_includes_pages_and_selection() {
-        let ctx = build_reader_context(3, &[4, 3, 3, 0], Some("  softmax  "), Some(10));
-        assert!(ctx.contains("Current page: 3 of 10"));
-        assert!(ctx.contains("Pages visible on screen: 3, 4"));
-        assert!(ctx.contains("<selection>\nsoftmax\n</selection>"));
+        let text = ctx(3, &[4, 3, 3, 0], Some("  softmax  "), None).render(Some(10));
+        assert!(text.contains("Current page: 3 of 10"));
+        assert!(text.contains("Pages visible on screen: 3, 4"));
+        assert!(text.contains("Text the reader has selected:\n<selection>\nsoftmax\n</selection>"));
+    }
+
+    #[test]
+    fn context_names_the_selection_page() {
+        let text = ctx(7, &[7], Some("softmax"), Some(3)).render(Some(10));
+        assert!(text.contains("Text the reader has selected on page 3:\n<selection>"));
     }
 
     #[test]
     fn context_omits_empty_parts() {
-        let ctx = build_reader_context(1, &[], Some("   "), None);
-        assert_eq!(ctx, "<reader_context>\nCurrent page: 1\n</reader_context>");
+        let text = ctx(1, &[], Some("   "), Some(2)).render(None);
+        assert_eq!(text, "<reader_context>\nCurrent page: 1\n</reader_context>");
     }
 }

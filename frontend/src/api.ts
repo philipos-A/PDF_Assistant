@@ -38,7 +38,8 @@ export interface StreamHandlers {
   onStatus?: (state: "thinking" | "writing" | "fallback") => void;
   onDelta: (text: string) => void;
   onDone?: (info: { stop_reason: string; model: string }) => void;
-  onError: (message: string) => void;
+  /** `refused` is true when Claude declined; any partial answer should be discarded. */
+  onError: (message: string, info: { refused: boolean }) => void;
 }
 
 /**
@@ -56,11 +57,11 @@ export async function streamChat(req: ChatRequest, handlers: StreamHandlers, sig
     });
   } catch (e) {
     if ((e as Error).name === "AbortError") return;
-    handlers.onError("Could not reach the backend. Is it running on port 8000?");
+    handlers.onError("Could not reach the backend. Is it running on port 8000?", { refused: false });
     return;
   }
   if (!res.ok || !res.body) {
-    handlers.onError(await errorMessage(res));
+    handlers.onError(await errorMessage(res), { refused: false });
     return;
   }
 
@@ -83,7 +84,7 @@ export async function streamChat(req: ChatRequest, handlers: StreamHandlers, sig
       payload = JSON.parse(data.join("\n"));
     } catch {
       finished = true;
-      handlers.onError("The server sent a response the app couldn't read.");
+      handlers.onError("The server sent a response the app couldn't read.", { refused: false });
       return;
     }
     switch (event) {
@@ -99,7 +100,7 @@ export async function streamChat(req: ChatRequest, handlers: StreamHandlers, sig
         break;
       case "error":
         finished = true;
-        handlers.onError(payload.message);
+        handlers.onError(payload.message, { refused: payload.refused === true });
         break;
     }
   };
@@ -118,8 +119,8 @@ export async function streamChat(req: ChatRequest, handlers: StreamHandlers, sig
     if (buffer.trim()) dispatch(buffer);
   } catch (e) {
     if ((e as Error).name === "AbortError") return;
-    handlers.onError("The connection was interrupted.");
+    handlers.onError("The connection was interrupted.", { refused: false });
     return;
   }
-  if (!finished) handlers.onError("The response ended unexpectedly.");
+  if (!finished) handlers.onError("The response ended unexpectedly.", { refused: false });
 }

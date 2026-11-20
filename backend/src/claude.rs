@@ -12,13 +12,17 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::config::Settings;
-use crate::prompts::{SYSTEM_PROMPT, build_reader_context};
+use crate::prompts::{ReaderContext, SYSTEM_PROMPT};
 
 /// Value of the `anthropic-version` header.
 pub const API_VERSION: &str = "2026-10-21";
 /// Beta that enables server-side refusal fallbacks (`fallbacks: "default"`).
 pub const FALLBACK_BETA: &str = "server-side-fallback-2026-07-01";
 const MAX_RETRIES: u32 = 2;
+
+const OVERLOADED: &str = "Claude is overloaded right now. Try again in a moment.";
+/// Sent when Claude declines. The frontend matches on `refused: true`, not on this text.
+const REFUSED: &str = "Claude declined to answer this question. Try rephrasing it.";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -33,19 +37,20 @@ pub enum Role {
 pub struct Turn {
     pub role: Role,
     pub content: String,
-    #[serde(default)]
-    pub current_page: Option<u32>,
-    #[serde(default)]
-    pub visible_pages: Option<Vec<u32>>,
-    #[serde(default)]
-    pub selected_text: Option<String>,
+    /// Sent flattened (`current_page`, `visible_pages`, …); absent on assistant turns.
+    #[serde(flatten)]
+    pub context: Option<ReaderContext>,
 }
 
-/// Drop empty turns and enforce user/assistant alternation. The result starts with a
-/// user turn and ends with an assistant turn, so the new question can follow it.
+/// Drop empty turns, strip reader context from assistant turns, and enforce
+/// user/assistant alternation. The result starts with a user turn and ends with an
+/// assistant turn, so the new question can follow it.
 pub fn normalize_history(history: Vec<Turn>) -> Vec<Turn> {
     let mut out: Vec<Turn> = Vec::new();
-    for turn in history {
+    for mut turn in history {
+        if turn.role == Role::Assistant {
+            turn.context = None;
+        }
         if turn.content.trim().is_empty() || (out.is_empty() && turn.role != Role::User) {
             continue;
         }
@@ -60,17 +65,12 @@ pub fn normalize_history(history: Vec<Turn>) -> Vec<Turn> {
     out
 }
 
-fn user_text(turn: &Turn, page_count: Option<usize>) -> String {
-    match turn.current_page {
-        None => turn.content.clone(),
-        Some(page) => {
-            let ctx = build_reader_context(
-                page,
-                turn.visible_pages.as_deref().unwrap_or(&[]),
-                turn.selected_text.as_deref(),
-                page_count,
-            );
-            format!("{ctx}\n\n{}", turn.content)
+impl Turn {
+    /// The text Claude sees for a user turn: reader context, then the question.
+    fn user_text(&self, page_count: Option<usize>) -> String {
+        match &self.context {
+            None => self.content.clone(),
+            Some(ctx) => format!("{}\n\n{}", ctx.render(page_count), self.content),
         }
     }
 }
@@ -101,7 +101,7 @@ pub fn build_messages(
         .enumerate()
         .map(|(i, turn)| match turn.role {
             Role::User => {
-                let text = json!({"type": "text", "text": user_text(turn, page_count)});
+                let text = json!({"type": "text", "text": turn.user_text(page_count)});
                 let content = if i == 0 {
                     vec![document_block.clone(), text]
                 } else {
@@ -178,7 +178,7 @@ fn status_error(settings: &Settings, status: StatusCode, body: &str) -> String {
             settings.claude_model
         ),
         429 => "Rate limited by the Anthropic API. Wait a moment and try again.".into(),
-        529 => "Claude is overloaded right now. Try again in a moment.".into(),
+        529 => OVERLOADED.into(),
         400 | 413 => format!("The request was rejected: {detail}"),
         code => format!("Anthropic API error ({code}): {detail}"),
     }
@@ -188,65 +188,99 @@ fn retryable(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500..=599)
 }
 
-fn retry_delay(resp: &reqwest::Response, attempt: u32) -> Duration {
-    let header = resp
-        .headers()
-        .get("retry-after")
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.parse::<f64>().ok());
-    match header {
-        Some(secs) => Duration::from_secs_f64(secs.clamp(0.0, 10.0)),
-        None => Duration::from_millis(500 * 2u64.pow(attempt)),
-    }
+/// Stream `error` types that mean "try again", when no text has streamed yet.
+fn retryable_stream_error(kind: &str) -> bool {
+    matches!(kind, "overloaded_error" | "api_error" | "rate_limit_error")
 }
 
-/// Send the request, retrying transient failures before any output has streamed.
-async fn send(
+/// Longest server-requested wait the reader sits through; anything longer fails at once.
+const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
+
+fn backoff(attempt: u32) -> Duration {
+    Duration::from_millis(500 * 2u64.pow(attempt))
+}
+
+/// The wait the server asked for: `retry-after-ms`, else `retry-after` in seconds.
+fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    let number = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.trim().parse::<f64>().ok())
+            .filter(|v| v.is_finite() && *v >= 0.0)
+    };
+    number("retry-after-ms")
+        .map(|ms| Duration::from_secs_f64(ms / 1000.0))
+        .or_else(|| number("retry-after").map(Duration::from_secs_f64))
+}
+
+/// Why an attempt failed: try again after a delay, or give up with a message.
+enum Failure {
+    Retry(Duration),
+    Fatal(String),
+}
+
+/// Send the request once. Transient failures come back as `Failure::Retry`
+/// while `attempt` is below `MAX_RETRIES`.
+async fn send_once(
     http: &reqwest::Client,
     settings: &Settings,
     body: &Value,
-) -> Result<reqwest::Response, String> {
+    attempt: u32,
+) -> Result<reqwest::Response, Failure> {
     let url = format!(
         "{}/v1/messages",
         settings.anthropic_base_url.trim_end_matches('/')
     );
-    let mut attempt = 0;
-    loop {
-        let mut req = http
-            .post(&url)
-            .header("x-api-key", &settings.anthropic_api_key)
-            .header("anthropic-version", API_VERSION)
-            .header("accept", "text/event-stream")
-            .json(body);
-        if settings.enable_fallbacks {
-            req = req.header("anthropic-beta", FALLBACK_BETA);
-        }
+    let mut req = http
+        .post(&url)
+        .header("x-api-key", &settings.anthropic_api_key)
+        .header("anthropic-version", API_VERSION)
+        .header("accept", "text/event-stream")
+        .json(body);
+    if settings.enable_fallbacks {
+        req = req.header("anthropic-beta", FALLBACK_BETA);
+    }
 
-        match req.send().await {
-            Ok(resp) if resp.status().is_success() => return Ok(resp),
-            Ok(resp) if retryable(resp.status()) && attempt < MAX_RETRIES => {
-                let delay = retry_delay(&resp, attempt);
-                tracing::warn!(status = %resp.status(), ?delay, "retrying Anthropic request");
-                tokio::time::sleep(delay).await;
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => Ok(resp),
+        Ok(resp) => {
+            let status = resp.status();
+            // The API can override the usual status-based decision.
+            let should_retry = match resp
+                .headers()
+                .get("x-should-retry")
+                .and_then(|v| v.to_str().ok())
+            {
+                Some("true") => true,
+                Some("false") => false,
+                _ => retryable(status),
+            };
+            if should_retry && attempt < MAX_RETRIES {
+                match retry_after(resp.headers()) {
+                    // The server wants a longer wait than is worth making the reader sit through.
+                    Some(wait) if wait > MAX_RETRY_AFTER => {}
+                    wait => {
+                        let delay = wait.unwrap_or_else(|| backoff(attempt));
+                        tracing::warn!(%status, ?delay, "retrying Anthropic request");
+                        return Err(Failure::Retry(delay));
+                    }
+                }
             }
-            Ok(resp) => {
-                let status = resp.status();
-                let text = resp.text().await.unwrap_or_default();
-                tracing::warn!(%status, body = %text, "Anthropic request failed");
-                return Err(status_error(settings, status, &text));
-            }
-            Err(e) if (e.is_connect() || e.is_timeout()) && attempt < MAX_RETRIES => {
-                tracing::warn!(error = %e, "retrying Anthropic request after connection error");
-                tokio::time::sleep(Duration::from_millis(500 * 2u64.pow(attempt))).await;
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "could not reach Anthropic");
-                return Err(
-                    "Could not reach the Anthropic API. Check your network connection.".into(),
-                );
-            }
+            let text = resp.text().await.unwrap_or_default();
+            tracing::warn!(%status, body = %text, "Anthropic request failed");
+            Err(Failure::Fatal(status_error(settings, status, &text)))
         }
-        attempt += 1;
+        Err(e) if (e.is_connect() || e.is_timeout()) && attempt < MAX_RETRIES => {
+            tracing::warn!(error = %e, "retrying Anthropic request after connection error");
+            Err(Failure::Retry(backoff(attempt)))
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "could not reach Anthropic");
+            Err(Failure::Fatal(
+                "Could not reach the Anthropic API. Check your network connection.".into(),
+            ))
+        }
     }
 }
 
@@ -352,100 +386,120 @@ pub fn stream_answer(
 ) -> impl Stream<Item = OutEvent> {
     async_stream::stream! {
         let body = request_body(&settings, messages);
-        let resp = match send(&http, &settings, &body).await {
-            Ok(r) => r,
-            Err(message) => {
-                yield OutEvent::error(message);
-                return;
-            }
-        };
-
-        let mut model = settings.claude_model.clone();
-        let mut usage = Usage::default();
-        let mut stop_reason: Option<String> = None;
-        let mut finished = false;
-
-        let frames = sse_frames(resp.bytes_stream());
-        futures_util::pin_mut!(frames);
-        while let Some(frame) = frames.next().await {
-            let (event, data) = match frame {
-                Ok(f) => f,
-                Err(e) => {
-                    tracing::warn!(error = %e, "stream interrupted");
-                    yield OutEvent::error("The connection to Claude was interrupted.");
+        let mut attempt = 0;
+        // Each pass is one request. Transient failures, including a stream `error`
+        // that arrives before any text, start the next pass, up to MAX_RETRIES times.
+        'attempt: loop {
+            let resp = match send_once(&http, &settings, &body, attempt).await {
+                Ok(r) => r,
+                Err(Failure::Retry(delay)) => {
+                    tokio::time::sleep(delay).await;
+                    attempt += 1;
+                    continue 'attempt;
+                }
+                Err(Failure::Fatal(message)) => {
+                    yield OutEvent::error(message);
                     return;
                 }
             };
-            let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
-            match event.as_str() {
-                "message_start" => {
-                    if let Some(m) = v.pointer("/message/model").and_then(Value::as_str) {
-                        model = m.to_string();
-                    }
-                    usage.merge(v.pointer("/message/usage"));
-                }
-                "content_block_start" => {
-                    // After a mid-answer fallback, message_start still names the
-                    // requested model; the fallback block names the one now answering.
-                    if let Some(m) = v.pointer("/content_block/to/model").and_then(Value::as_str) {
-                        model = m.to_string();
-                    }
-                    let state = match v.pointer("/content_block/type").and_then(Value::as_str) {
-                        Some("thinking") => Some("thinking"),
-                        Some("fallback") => Some("fallback"),
-                        Some("text") => Some("writing"),
-                        _ => None,
-                    };
-                    if let Some(state) = state {
-                        yield OutEvent::new("status", json!({"state": state}));
-                    }
-                }
-                "content_block_delta" => {
-                    if v.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
-                        && let Some(text) = v.pointer("/delta/text").and_then(Value::as_str)
-                    {
-                        yield OutEvent::new("delta", json!({"text": text}));
-                    }
-                }
-                "message_delta" => {
-                    if let Some(r) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
-                        stop_reason = Some(r.to_string());
-                    }
-                    usage.merge(v.get("usage"));
-                }
-                "message_stop" => finished = true,
-                "error" => {
-                    let kind = v.pointer("/error/type").and_then(Value::as_str).unwrap_or("");
-                    let msg = v.pointer("/error/message").and_then(Value::as_str).unwrap_or("unknown error");
-                    yield OutEvent::error(if kind == "overloaded_error" {
-                        "Claude is overloaded right now. Try again in a moment.".to_string()
-                    } else {
-                        format!("Claude returned an error: {msg}")
-                    });
-                    return;
-                }
-                _ => {} // ping, content_block_stop, unknown future events
-            }
-        }
 
-        if stop_reason.as_deref() == Some("refusal") {
-            yield OutEvent::error("Claude declined to answer this question. Try rephrasing it.");
+            let mut model = settings.claude_model.clone();
+            let mut usage = Usage::default();
+            let mut stop_reason: Option<String> = None;
+            let mut finished = false;
+            let mut sent_text = false;
+
+            let frames = sse_frames(resp.bytes_stream());
+            futures_util::pin_mut!(frames);
+            while let Some(frame) = frames.next().await {
+                let (event, data) = match frame {
+                    Ok(f) => f,
+                    Err(e) => {
+                        tracing::warn!(error = %e, "stream interrupted");
+                        yield OutEvent::error("The connection to Claude was interrupted.");
+                        return;
+                    }
+                };
+                let Ok(v) = serde_json::from_str::<Value>(&data) else { continue };
+                match event.as_str() {
+                    "message_start" => {
+                        if let Some(m) = v.pointer("/message/model").and_then(Value::as_str) {
+                            model = m.to_string();
+                        }
+                        usage.merge(v.pointer("/message/usage"));
+                    }
+                    "content_block_start" => {
+                        // After a mid-answer fallback, message_start still names the
+                        // requested model; the fallback block names the one now answering.
+                        if let Some(m) = v.pointer("/content_block/to/model").and_then(Value::as_str) {
+                            model = m.to_string();
+                        }
+                        let state = match v.pointer("/content_block/type").and_then(Value::as_str) {
+                            Some("thinking") => Some("thinking"),
+                            Some("fallback") => Some("fallback"),
+                            Some("text") => Some("writing"),
+                            _ => None,
+                        };
+                        if let Some(state) = state {
+                            yield OutEvent::new("status", json!({"state": state}));
+                        }
+                    }
+                    "content_block_delta" => {
+                        if v.pointer("/delta/type").and_then(Value::as_str) == Some("text_delta")
+                            && let Some(text) = v.pointer("/delta/text").and_then(Value::as_str)
+                        {
+                            sent_text = true;
+                            yield OutEvent::new("delta", json!({"text": text}));
+                        }
+                    }
+                    "message_delta" => {
+                        if let Some(r) = v.pointer("/delta/stop_reason").and_then(Value::as_str) {
+                            stop_reason = Some(r.to_string());
+                        }
+                        usage.merge(v.get("usage"));
+                    }
+                    "message_stop" => finished = true,
+                    "error" => {
+                        let kind = v.pointer("/error/type").and_then(Value::as_str).unwrap_or("");
+                        if !sent_text && attempt < MAX_RETRIES && retryable_stream_error(kind) {
+                            let delay = backoff(attempt);
+                            tracing::warn!(kind, ?delay, "retrying after stream error");
+                            tokio::time::sleep(delay).await;
+                            attempt += 1;
+                            continue 'attempt;
+                        }
+                        let msg = v.pointer("/error/message").and_then(Value::as_str).unwrap_or("unknown error");
+                        yield OutEvent::error(if kind == "overloaded_error" {
+                            OVERLOADED.to_string()
+                        } else {
+                            format!("Claude returned an error: {msg}")
+                        });
+                        return;
+                    }
+                    _ => {} // ping, content_block_stop, unknown future events
+                }
+            }
+
+            if stop_reason.as_deref() == Some("refusal") {
+                yield OutEvent::new("error", json!({"message": REFUSED, "refused": true}));
+                return;
+            }
+            if !finished && stop_reason.is_none() {
+                yield OutEvent::error("The response from Claude ended unexpectedly.");
+                return;
+            }
+            yield OutEvent::new("done", json!({
+                "stop_reason": stop_reason,
+                "model": model,
+                "usage": {
+                    "input_tokens": usage.input_tokens,
+                    "output_tokens": usage.output_tokens,
+                    "cache_read_input_tokens": usage.cache_read_input_tokens,
+                    "cache_creation_input_tokens": usage.cache_creation_input_tokens,
+                },
+            }));
             return;
         }
-        if !finished && stop_reason.is_none() {
-            yield OutEvent::error("The response from Claude ended unexpectedly.");
-            return;
-        }
-        yield OutEvent::new("done", json!({
-            "stop_reason": stop_reason,
-            "model": model,
-            "usage": {
-                "input_tokens": usage.input_tokens,
-                "output_tokens": usage.output_tokens,
-                "cache_read_input_tokens": usage.cache_read_input_tokens,
-                "cache_creation_input_tokens": usage.cache_creation_input_tokens,
-            },
-        }));
     }
 }
 
@@ -457,9 +511,7 @@ mod tests {
         Turn {
             role,
             content: content.into(),
-            current_page: None,
-            visible_pages: None,
-            selected_text: None,
+            context: None,
         }
     }
 

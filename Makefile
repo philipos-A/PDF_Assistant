@@ -18,8 +18,9 @@ backend:
 frontend:
 	cd frontend && npm run dev
 
-test: ## Run backend tests (Claude is mocked; no API calls)
+test: ## Run backend tests (Claude is mocked; no API calls) and frontend unit tests
 	cd backend && cargo test
+	cd frontend && npm test
 
 lint:
 	cd backend && cargo clippy --all-targets -- -D warnings && cargo fmt --check

@@ -16,6 +16,7 @@ use serde_json::{Value, json};
 
 use crate::AppState;
 use crate::claude::{self, Role, Turn};
+use crate::prompts::ReaderContext;
 use crate::storage::{DocumentMeta, StoreError};
 
 /// Error responses use `{"detail": "..."}`, which the frontend displays.
@@ -243,11 +244,8 @@ pub async fn get_document_file(
 pub struct ChatRequest {
     doc_id: String,
     question: String,
-    current_page: u32,
-    #[serde(default)]
-    visible_pages: Vec<u32>,
-    #[serde(default)]
-    selected_text: Option<String>,
+    #[serde(flatten)]
+    context: ReaderContext,
     #[serde(default)]
     history: Vec<Turn>,
 }
@@ -266,19 +264,21 @@ fn validate(req: &ChatRequest) -> ApiResult<()> {
             "question is too long (max 10,000 characters).",
         ));
     }
-    if req.current_page < 1 {
+    if req.context.current_page < 1 {
         return Err(unprocessable("current_page must be at least 1."));
     }
     if req.history.len() > 200 {
         return Err(unprocessable("history is too long (max 200 turns)."));
     }
-    let too_long_selection =
-        |s: &Option<String>| s.as_ref().is_some_and(|s| s.chars().count() > 20_000);
-    if too_long_selection(&req.selected_text)
+    let too_long_selection = |c: Option<&ReaderContext>| {
+        c.and_then(|c| c.selected_text.as_ref())
+            .is_some_and(|s| s.chars().count() > 20_000)
+    };
+    if too_long_selection(Some(&req.context))
         || req
             .history
             .iter()
-            .any(|t| too_long_selection(&t.selected_text))
+            .any(|t| too_long_selection(t.context.as_ref()))
     {
         return Err(unprocessable(
             "selected_text is too long (max 20,000 characters).",
@@ -320,28 +320,12 @@ pub async fn chat(
     let meta = state.store.get_meta(&req.doc_id).await.map_err(not_found)?;
     let pdf = state.store.get_pdf(&req.doc_id).await.map_err(not_found)?;
 
-    let history = req
-        .history
-        .into_iter()
-        .map(|t| match t.role {
-            Role::User => t,
-            // Reader context only applies to user turns.
-            Role::Assistant => Turn {
-                current_page: None,
-                visible_pages: None,
-                selected_text: None,
-                ..t
-            },
-        })
-        .collect();
     let question = Turn {
         role: Role::User,
         content: req.question.trim().to_string(),
-        current_page: Some(req.current_page),
-        visible_pages: Some(req.visible_pages),
-        selected_text: req.selected_text,
+        context: Some(req.context),
     };
-    let messages = claude::build_messages(&pdf, history, question, Some(meta.page_count));
+    let messages = claude::build_messages(&pdf, req.history, question, Some(meta.page_count));
 
     let events = claude::stream_answer(state.http.clone(), (**settings).clone(), messages)
         .map(|e| Ok(Event::default().event(e.event).data(e.data.to_string())));

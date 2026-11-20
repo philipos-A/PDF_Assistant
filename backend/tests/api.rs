@@ -147,9 +147,28 @@ struct Recorded {
     calls: usize,
 }
 
-/// Start a mock Anthropic API. `respond` returns (status, content-type, body) for each call number.
+/// Start a mock Anthropic API. `respond` returns (status, content-type, body) for each call
+/// number. Every reply carries `retry-after: 0`.
 async fn mock_claude(
     respond: impl Fn(usize) -> (StatusCode, &'static str, String) + Send + Sync + 'static,
+) -> (String, Arc<Mutex<Recorded>>) {
+    mock_claude_with_headers(move |n| {
+        let (status, ctype, body) = respond(n);
+        (status, ctype, body, vec![("retry-after", "0")])
+    })
+    .await
+}
+
+type MockReply = (
+    StatusCode,
+    &'static str,
+    String,
+    Vec<(&'static str, &'static str)>,
+);
+
+/// Like `mock_claude`, but `respond` also chooses the extra response headers.
+async fn mock_claude_with_headers(
+    respond: impl Fn(usize) -> MockReply + Send + Sync + 'static,
 ) -> (String, Arc<Mutex<Recorded>>) {
     let rec = Arc::new(Mutex::new(Recorded::default()));
     let rec2 = rec.clone();
@@ -167,13 +186,12 @@ async fn mock_claude(
                     r.headers = Some(headers);
                     r.calls
                 };
-                let (status, ctype, body) = respond(n);
-                (
-                    status,
-                    [("content-type", ctype), ("retry-after", "0")],
-                    body,
-                )
-                    .into_response()
+                let (status, ctype, body, extra) = respond(n);
+                let mut resp = (status, [("content-type", ctype)], body).into_response();
+                for (name, value) in extra {
+                    resp.headers_mut().insert(name, value.parse().unwrap());
+                }
+                resp
             }
         }),
     );
@@ -351,6 +369,7 @@ async fn chat_streams_answer_and_builds_cached_request() {
             "current_page": 2,
             "visible_pages": [3, 2],
             "selected_text": "attention is all you need",
+            "selection_page": 3,
             "history": [
                 {"role": "user", "content": "Summarize p. 1", "current_page": 1, "visible_pages": [1]},
                 {"role": "assistant", "content": "It introduces...", "current_page": 9},
@@ -419,7 +438,9 @@ async fn chat_streams_answer_and_builds_cached_request() {
     let last = msgs[2]["content"][0]["text"].as_str().unwrap();
     assert!(last.contains("Current page: 2 of 4"));
     assert!(last.contains("Pages visible on screen: 2, 3"));
-    assert!(last.contains("attention is all you need"));
+    assert!(last.contains(
+        "Text the reader has selected on page 3:\n<selection>\nattention is all you need\n</selection>"
+    ));
     assert!(last.ends_with("\n\nWhat does this mean?"));
     assert!(
         msgs[0]["content"][1]["text"]
@@ -450,6 +471,8 @@ async fn chat_refusal_becomes_error_event() {
     let (event, data) = parse_sse(&body).pop().unwrap();
     assert_eq!(event, "error");
     assert!(data["message"].as_str().unwrap().contains("declined"));
+    // Lets the frontend discard the partial answer that streamed before the refusal.
+    assert_eq!(data["refused"], true);
 }
 
 #[tokio::test]
@@ -457,10 +480,11 @@ async fn chat_reports_fallback_and_mid_stream_errors() {
     let stream = [
         sse("message_start", json!({"type": "message_start", "message": {"model": "claude-sonnet-5", "usage": {}}})),
         sse("content_block_start", json!({"type": "content_block_start", "index": 0, "content_block": {"type": "fallback"}})),
+        sse("content_block_delta", json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": "Partial"}})),
         sse("error", json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}})),
     ]
     .concat();
-    let (url, _) =
+    let (url, rec) =
         mock_claude(move |_| (StatusCode::OK, "text/event-stream", stream.clone())).await;
     let (app, _dir) = test_app(&url, "test-key");
     let doc_id = upload(&app, 1).await;
@@ -477,13 +501,16 @@ async fn chat_reports_fallback_and_mid_stream_errors() {
         events[0],
         ("status".to_string(), json!({"state": "fallback"}))
     );
-    assert_eq!(events[1].0, "error");
+    assert_eq!(events[1].0, "delta");
+    assert_eq!(events[2].0, "error");
     assert!(
-        events[1].1["message"]
+        events[2].1["message"]
             .as_str()
             .unwrap()
             .contains("overloaded")
     );
+    // Output had already streamed, so the error is not retried.
+    assert_eq!(rec.lock().unwrap().calls, 1);
 }
 
 #[tokio::test]
@@ -546,6 +573,113 @@ async fn chat_retries_transient_errors_then_succeeds() {
     .await;
     assert_eq!(parse_sse(&body).last().unwrap().0, "done");
     assert_eq!(rec.lock().unwrap().calls, 2);
+}
+
+async fn ask(app: &Router, doc_id: &str) -> Vec<(String, Value)> {
+    let (_, _, body) = send(
+        app,
+        json_post(
+            "/api/chat",
+            json!({"doc_id": doc_id, "question": "hi", "current_page": 1}),
+        ),
+    )
+    .await;
+    parse_sse(&body)
+}
+
+#[tokio::test]
+async fn chat_retries_stream_error_before_any_output() {
+    let (url, rec) = mock_claude(|n| {
+        let body = if n == 1 {
+            [
+                sse("message_start", json!({"type": "message_start", "message": {"model": "claude-sonnet-5-5", "usage": {}}})),
+                sse("error", json!({"type": "error", "error": {"type": "overloaded_error", "message": "Overloaded"}})),
+            ]
+            .concat()
+        } else {
+            ok_stream("end_turn")
+        };
+        (StatusCode::OK, "text/event-stream", body)
+    })
+    .await;
+    let (app, _dir) = test_app(&url, "test-key");
+    let doc_id = upload(&app, 1).await;
+    let events = ask(&app, &doc_id).await;
+    assert!(events.iter().all(|(e, _)| e != "error"), "{events:?}");
+    assert!(events.iter().any(|(e, _)| e == "done"));
+    assert_eq!(rec.lock().unwrap().calls, 2);
+}
+
+#[tokio::test]
+async fn chat_fails_fast_when_retry_after_is_too_long() {
+    let (url, rec) = mock_claude_with_headers(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            "application/json",
+            r#"{"type":"error","error":{"type":"rate_limit_error","message":"slow down"}}"#.into(),
+            vec![("retry-after", "30")],
+        )
+    })
+    .await;
+    let (app, _dir) = test_app(&url, "test-key");
+    let doc_id = upload(&app, 1).await;
+    let events = ask(&app, &doc_id).await;
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].0, "error");
+    assert!(
+        events[0].1["message"]
+            .as_str()
+            .unwrap()
+            .contains("Rate limited")
+    );
+    assert_eq!(rec.lock().unwrap().calls, 1);
+}
+
+#[tokio::test]
+async fn chat_prefers_retry_after_ms() {
+    let (url, rec) = mock_claude_with_headers(|n| {
+        if n == 1 {
+            (
+                StatusCode::from_u16(529).unwrap(),
+                "application/json",
+                r#"{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}"#
+                    .into(),
+                // retry-after alone would exceed the cap; retry-after-ms wins.
+                vec![("retry-after-ms", "5"), ("retry-after", "30")],
+            )
+        } else {
+            (
+                StatusCode::OK,
+                "text/event-stream",
+                ok_stream("end_turn"),
+                vec![],
+            )
+        }
+    })
+    .await;
+    let (app, _dir) = test_app(&url, "test-key");
+    let doc_id = upload(&app, 1).await;
+    let events = ask(&app, &doc_id).await;
+    assert!(events.iter().any(|(e, _)| e == "done"), "{events:?}");
+    assert_eq!(rec.lock().unwrap().calls, 2);
+}
+
+#[tokio::test]
+async fn chat_respects_x_should_retry_false() {
+    let (url, rec) = mock_claude_with_headers(|_| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "application/json",
+            r#"{"type":"error","error":{"type":"api_error","message":"boom"}}"#.into(),
+            vec![("retry-after", "0"), ("x-should-retry", "false")],
+        )
+    })
+    .await;
+    let (app, _dir) = test_app(&url, "test-key");
+    let doc_id = upload(&app, 1).await;
+    let events = ask(&app, &doc_id).await;
+    assert_eq!(events[0].0, "error");
+    assert_eq!(rec.lock().unwrap().calls, 1);
 }
 
 #[tokio::test]

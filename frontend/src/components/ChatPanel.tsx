@@ -2,7 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react
 import { streamChat } from "../api";
 import { useSpeechRecognition } from "../hooks/useSpeechRecognition";
 import { useSpeechSynthesis } from "../hooks/useSpeechSynthesis";
-import type { ChatMessage, DocInfo, HistoryTurn } from "../types";
+import type { ChatMessage, DocInfo, HistoryTurn, ReaderContext } from "../types";
 import { CloseIcon, SendIcon, SpeakerIcon, SpeakerOffIcon, StopIcon } from "./icons";
 import { Message } from "./Message";
 import { MicButton } from "./MicButton";
@@ -34,15 +34,9 @@ const uid = () => Math.random().toString(36).slice(2);
 function toHistory(messages: ChatMessage[]): HistoryTurn[] {
   return messages
     .filter((m) => m.status === "done" && m.content.trim())
-    .map((m) =>
+    .map((m): HistoryTurn =>
       m.role === "user"
-        ? {
-            role: "user",
-            content: m.content,
-            current_page: m.page,
-            visible_pages: m.visiblePages,
-            selected_text: m.selectedText,
-          }
+        ? { role: "user", content: m.content, ...(m.context ?? { current_page: m.page, visible_pages: [] }) }
         : { role: "assistant", content: m.content },
     );
 }
@@ -77,14 +71,18 @@ export function ChatPanel({ doc, currentPage, visiblePages, selectionRequest, on
       if (!question && attached) question = "Explain this passage in plain language.";
       if (!question) return;
 
-      const selected = attached?.text;
+      const context: ReaderContext = {
+        current_page: currentPage,
+        visible_pages: visiblePages,
+        selected_text: attached?.text,
+        selection_page: attached?.page ?? undefined,
+      };
       const userMsg: ChatMessage = {
         id: uid(),
         role: "user",
         content: question,
         page: currentPage,
-        visiblePages,
-        selectedText: selected,
+        context,
         status: "done",
       };
       const assistantId = uid();
@@ -106,14 +104,7 @@ export function ChatPanel({ doc, currentPage, visiblePages, selectionRequest, on
       abortRef.current = controller;
       let answer = "";
       await streamChat(
-        {
-          doc_id: doc.doc_id,
-          question,
-          current_page: currentPage,
-          visible_pages: visiblePages,
-          selected_text: selected,
-          history,
-        },
+        { doc_id: doc.doc_id, question, ...context, history },
         {
           onStatus: (state) => {
             if (state === "thinking") update(assistantId, (m) => (m.content ? {} : { status: "thinking" }));
@@ -127,7 +118,9 @@ export function ChatPanel({ doc, currentPage, visiblePages, selectionRequest, on
             update(assistantId, { status: "done" });
             if (readAloud && answer) tts.speak(answer);
           },
-          onError: (message) => update(assistantId, { status: "error", error: message }),
+          // On a refusal, drop the partial answer that streamed before it.
+          onError: (message, { refused }) =>
+            update(assistantId, refused ? { status: "error", error: message, content: "" } : { status: "error", error: message }),
         },
         controller.signal,
       );

@@ -41,5 +41,5 @@ Effort is GA and goes inside `output_config`. Claude Sonnet 5.5 supports all fiv
 ## Recommended code changes (WRONG items only)
 
 1. **Done.** **Serving model after a mid-output fallback** (claude.rs, `content_block_start` arm): when `content_block.type == "fallback"`, set `model` from `content_block.to.model`. Optionally, also check `message_delta.usage.iterations` for a `fallback_message` entry and report a `served_by_fallback` flag in the `done` event.
-2. **Honor `retry-after` fully** (claude.rs `retry_delay`): remove the 10 s clamp. If the wait must be bounded for UX, fail fast with the rate-limit message when `retry-after` exceeds the bound, rather than retrying early. Also read `retry-after-ms` first, and respect `x-should-retry` in `retryable`.
+2. **Done (fails fast above 10 s instead of waiting).** **Honor `retry-after` fully** (claude.rs `retry_delay`): remove the 10 s clamp. If the wait must be bounded for UX, fail fast with the rate-limit message when `retry-after` exceeds the bound, rather than retrying early. Also read `retry-after-ms` first, and respect `x-should-retry` in `retryable`.
 3. **Comments/docs only:** any mention of a 32 MB request limit should say 128 MB (first-party API). No change to `max_upload_mb=24` is needed.

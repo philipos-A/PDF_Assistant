@@ -62,14 +62,20 @@ you can click to jump to, and render math with KaTeX.
    selection it was originally asked with, so the conversation prefix stays
    byte-identical from one request to the next and can be cached too.
 3. The new question is prefixed with a `<reader_context>` block (current page,
-   visible pages, selected text).
+   visible pages, selected text and the page it was selected on).
 4. The answer streams back as SSE. The `done` event includes token usage,
    including `cache_read_input_tokens`, so you can confirm caching is working.
 
 Anthropic has no official Rust SDK, so the backend calls the Messages API
 directly over HTTP (`anthropic-version: 2026-10-21`) and parses the
 streamed response itself. Rate-limit, overload and server errors are retried
-up to twice before any output has streamed, honouring `retry-after`.
+up to twice before any output has streamed, whether they arrive as an HTTP
+status or as an `error` event in the stream. Retries honour `retry-after-ms`,
+`retry-after` and `x-should-retry`; if the server asks for a wait longer than
+10 seconds, the error is shown right away instead.
+
+If Claude declines a question partway through an answer, the partial answer is
+discarded and only the error is shown.
 
 The default model is `claude-sonnet-5-5` with effort `medium`. If a safety
 classifier declines a request, the server-side fallback (`fallbacks: "default"`)
@@ -127,7 +133,7 @@ Open <http://localhost:5173>. The backend runs on <http://localhost:8000>
 ### Tests and build
 
 ```bash
-make test                 # cargo test: unit tests + API tests against a mock Claude server
+make test                 # cargo test (unit + API tests against a mock Claude server), then Vitest
 make lint                 # clippy + rustfmt check
 make build                # release backend binary + frontend production build
 ```
@@ -201,7 +207,7 @@ frontend/
 - Use the Files API to upload each PDF once instead of re-sending base64.
 - Enable Claude's citations on the document block for exact quoted passages.
 - Highlight cited passages in the viewer, and add search inside the PDF.
-- Add frontend tests (Vitest + Testing Library) and CI.
+- Add component tests (Testing Library) and CI. Vitest currently covers only `src/lib/`.
 
 ## License
 
