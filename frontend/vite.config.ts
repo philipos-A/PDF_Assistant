@@ -1,3 +1,4 @@
+/// <reference types="vitest/config" />
 import tailwindcss from "@tailwindcss/vite";
 import react from "@vitejs/plugin-react";
 import { defineConfig } from "vite";
@@ -14,5 +15,10 @@ export default defineConfig({
         changeOrigin: true,
       },
     },
+  },
+  test: {
+    // Component tests render into jsdom; the pure helpers in src/lib run there too.
+    environment: "jsdom",
+    setupFiles: ["src/test/setup.ts"],
   },
 });
