@@ -2,13 +2,14 @@ import { useRef, useState } from "react";
 import { uploadDocument } from "../api";
 import type { DocInfo, Health } from "../types";
 import { FileIcon, UploadIcon } from "./icons";
+import { Library } from "./Library";
 
 interface Props {
   health: Health | null;
-  onUploaded: (doc: DocInfo) => void;
+  onOpen: (doc: DocInfo) => void;
 }
 
-export function UploadView({ health, onUploaded }: Props) {
+export function UploadView({ health, onOpen }: Props) {
   const inputRef = useRef<HTMLInputElement>(null);
   const [dragging, setDragging] = useState(false);
   const [uploading, setUploading] = useState<string | null>(null);
@@ -29,7 +30,7 @@ export function UploadView({ health, onUploaded }: Props) {
     }
     setUploading(file.name);
     try {
-      onUploaded(await uploadDocument(file));
+      onOpen(await uploadDocument(file));
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -101,6 +102,8 @@ export function UploadView({ health, onUploaded }: Props) {
             {error}
           </p>
         )}
+
+        <Library onOpen={onOpen} />
       </div>
     </div>
   );

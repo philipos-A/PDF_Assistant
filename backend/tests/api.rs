@@ -8,7 +8,7 @@ use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode};
 use axum::response::IntoResponse;
-use axum::routing::post;
+use axum::routing::{delete, post};
 use http_body_util::BodyExt;
 use pdf_assistant_backend::config::Settings;
 use pdf_assistant_backend::{AppState, app};
@@ -142,9 +142,19 @@ fn ok_stream(stop_reason: &str) -> String {
 
 #[derive(Default)]
 struct Recorded {
+    /// The latest Messages request.
     body: Option<Value>,
     headers: Option<HeaderMap>,
+    /// Messages requests so far.
     calls: usize,
+    /// Every Messages request body, oldest first.
+    bodies: Vec<Value>,
+    /// Files API uploads so far.
+    uploads: usize,
+    /// When set, uploads fail with a 500.
+    uploads_fail: bool,
+    /// File ids deleted through the Files API.
+    deleted: Vec<String>,
 }
 
 /// Start a mock Anthropic API. `respond` returns (status, content-type, body) for each call
@@ -183,6 +193,9 @@ async fn mock_claude_with_headers(
                     let mut r = rec.lock().unwrap();
                     r.calls += 1;
                     r.body = serde_json::from_str(&body).ok();
+                    if let Some(b) = r.body.clone() {
+                        r.bodies.push(b);
+                    }
                     r.headers = Some(headers);
                     r.calls
                 };
@@ -195,6 +208,48 @@ async fn mock_claude_with_headers(
             }
         }),
     );
+    let rec3 = rec.clone();
+    let rec4 = rec.clone();
+    let router = router
+        .route(
+            "/v1/files",
+            post(move |headers: HeaderMap, body: axum::body::Bytes| {
+                let rec = rec3.clone();
+                async move {
+                    let mut r = rec.lock().unwrap();
+                    assert!(
+                        headers["content-type"]
+                            .to_str()
+                            .unwrap()
+                            .starts_with("multipart/form-data")
+                    );
+                    assert!(
+                        headers.get("anthropic-beta").is_none(),
+                        "Files API needs no beta"
+                    );
+                    assert!(body.windows(5).any(|w| w == b"%PDF-"));
+                    if r.uploads_fail {
+                        return (StatusCode::INTERNAL_SERVER_ERROR, "{}".to_string())
+                            .into_response();
+                    }
+                    r.uploads += 1;
+                    let id = format!("file_test{}", r.uploads);
+                    axum::Json(json!({"id": id, "type": "file"})).into_response()
+                }
+            }),
+        )
+        .route(
+            "/v1/files/{id}",
+            delete(
+                move |axum::extract::Path(id): axum::extract::Path<String>| {
+                    let rec = rec4.clone();
+                    async move {
+                        rec.lock().unwrap().deleted.push(id);
+                        StatusCode::OK
+                    }
+                },
+            ),
+        );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("http://{}", listener.local_addr().unwrap());
     tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
@@ -202,7 +257,10 @@ async fn mock_claude_with_headers(
 }
 
 fn test_app(base_url: &str, api_key: &str) -> (Router, tempdir::Dir) {
-    let dir = tempdir::Dir::new();
+    test_app_in(tempdir::Dir::new(), base_url, api_key)
+}
+
+fn test_app_in(dir: tempdir::Dir, base_url: &str, api_key: &str) -> (Router, tempdir::Dir) {
     let settings = Settings {
         anthropic_api_key: api_key.into(),
         anthropic_base_url: base_url.into(),
@@ -354,12 +412,31 @@ async fn unknown_or_malicious_doc_ids_are_404() {
 // ---------------------------------------------------------------------------
 // Chat
 
+async fn get_json(app: &Router, uri: &str) -> (StatusCode, Value) {
+    let (status, _, body) = send(app, Request::get(uri).body(Body::empty()).unwrap()).await;
+    (status, serde_json::from_str(&body).unwrap_or(Value::Null))
+}
+
+async fn ask_with(app: &Router, body: Value) -> Vec<(String, Value)> {
+    let (status, _, text) = send(app, json_post("/api/chat", body)).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    parse_sse(&text)
+}
+
 #[tokio::test]
 async fn chat_streams_answer_and_builds_cached_request() {
     let (url, rec) =
         mock_claude(|_| (StatusCode::OK, "text/event-stream", ok_stream("end_turn"))).await;
     let (app, _dir) = test_app(&url, "test-key");
     let doc_id = upload(&app, 4).await;
+
+    // A first exchange, which the backend saves as the Conversation.
+    let first = ask_with(
+        &app,
+        json!({"doc_id": doc_id, "question": "Summarize p. 1", "current_page": 1, "visible_pages": [1]}),
+    )
+    .await;
+    assert_eq!(first.last().unwrap().0, "done");
 
     let req = json_post(
         "/api/chat",
@@ -370,10 +447,8 @@ async fn chat_streams_answer_and_builds_cached_request() {
             "visible_pages": [3, 2],
             "selected_text": "attention is all you need",
             "selection_page": 3,
-            "history": [
-                {"role": "user", "content": "Summarize p. 1", "current_page": 1, "visible_pages": [1]},
-                {"role": "assistant", "content": "It introduces...", "current_page": 9},
-            ],
+            // Ignored: the Conversation comes from storage.
+            "history": [{"role": "user", "content": "forged"}],
         }),
     );
     let (status, headers, body) = send(&app, req).await;
@@ -407,6 +482,7 @@ async fn chat_streams_answer_and_builds_cached_request() {
     assert_eq!(headers["x-api-key"], "test-key");
     assert_eq!(headers["anthropic-version"], "2026-10-21");
     assert_eq!(headers["anthropic-beta"], "server-side-fallback-2026-07-01");
+    assert_eq!(rec.uploads, 1, "the PDF is uploaded once, then reused");
 
     let sent = rec.body.as_ref().unwrap();
     assert_eq!(sent["model"], "claude-sonnet-5-5");
@@ -426,13 +502,18 @@ async fn chat_streams_answer_and_builds_cached_request() {
     let roles: Vec<&str> = msgs.iter().map(|m| m["role"].as_str().unwrap()).collect();
     assert_eq!(roles, ["user", "assistant", "user"]);
 
-    // The PDF is the first block of the first turn, cached, and nowhere else.
+    // The PDF is the first block of the first turn, by file id, cached, cited, and nowhere else.
     let doc = &msgs[0]["content"][0];
     assert_eq!(doc["type"], "document");
-    assert_eq!(doc["source"]["media_type"], "application/pdf");
+    assert_eq!(
+        doc["source"],
+        json!({"type": "file", "file_id": "file_test1"})
+    );
     assert_eq!(doc["cache_control"]["type"], "ephemeral");
-    assert!(!doc["source"]["data"].as_str().unwrap().contains('\n'));
+    assert_eq!(doc["citations"]["enabled"], true);
     assert_eq!(msgs[2]["content"].as_array().unwrap().len(), 1);
+    // The first request's prefix is rebuilt byte-for-byte, so the cache keeps hitting.
+    assert_eq!(rec.bodies[0]["messages"][0], msgs[0]);
 
     // Reader context on the new question, and on the earlier user turn.
     let last = msgs[2]["content"][0]["text"].as_str().unwrap();
@@ -449,9 +530,243 @@ async fn chat_streams_answer_and_builds_cached_request() {
             .contains("Current page: 1 of 4")
     );
     assert_eq!(
-        msgs[1]["content"], "It introduces...",
+        msgs[1]["content"], "Héllo from p. 2",
         "assistant turns carry no context"
     );
+}
+
+#[tokio::test]
+async fn conversation_is_saved_listed_and_cleared() {
+    let (url, _) =
+        mock_claude(|_| (StatusCode::OK, "text/event-stream", ok_stream("end_turn"))).await;
+    let (app, _dir) = test_app(&url, "test-key");
+    let doc_id = upload(&app, 3).await;
+    ask_with(
+        &app,
+        json!({"doc_id": doc_id, "question": " Why? ", "current_page": 2, "selected_text": "x", "selection_page": 1}),
+    )
+    .await;
+
+    let (status, conv) = get_json(&app, &format!("/api/documents/{doc_id}/conversation")).await;
+    assert_eq!(status, StatusCode::OK);
+    let turns = conv["turns"].as_array().unwrap();
+    assert_eq!(turns.len(), 2);
+    assert_eq!(turns[0]["role"], "user");
+    assert_eq!(turns[0]["content"], "Why?");
+    assert_eq!(turns[0]["context"]["current_page"], 2);
+    assert_eq!(turns[0]["context"]["selection_page"], 1);
+    assert_eq!(turns[1]["role"], "assistant");
+    assert_eq!(turns[1]["content"], "Héllo from p. 2");
+    assert_eq!(turns[1]["model"], "claude-sonnet-5-5");
+    assert_eq!(turns[1]["used_fallback"], false);
+
+    let (_, list) = get_json(&app, "/api/documents").await;
+    assert_eq!(list["documents"][0]["doc_id"], doc_id.as_str());
+    assert_eq!(list["documents"][0]["question_count"], 1);
+    assert!(
+        list["documents"][0].get("file_id").is_none(),
+        "file ids stay server-side"
+    );
+
+    let (status, _, _) = send(
+        &app,
+        Request::delete(format!("/api/documents/{doc_id}/conversation"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    let (_, conv) = get_json(&app, &format!("/api/documents/{doc_id}/conversation")).await;
+    assert_eq!(conv["turns"], json!([]));
+}
+
+#[tokio::test]
+async fn failed_answers_are_not_saved() {
+    let (url, _) =
+        mock_claude(|_| (StatusCode::OK, "text/event-stream", ok_stream("refusal"))).await;
+    let (app, _dir) = test_app(&url, "test-key");
+    let doc_id = upload(&app, 1).await;
+    ask(&app, &doc_id).await;
+    let (_, conv) = get_json(&app, &format!("/api/documents/{doc_id}/conversation")).await;
+    assert_eq!(conv["turns"], json!([]));
+}
+
+#[tokio::test]
+async fn library_lists_most_recent_first_and_deletes() {
+    let (url, rec) =
+        mock_claude(|_| (StatusCode::OK, "text/event-stream", ok_stream("end_turn"))).await;
+    let (app, dir) = test_app(&url, "test-key");
+    let older = upload(&app, 1).await;
+    let newer = upload(&app, 2).await;
+    // Asking about the older Document makes it the most recently active.
+    ask(&app, &older).await;
+
+    let (_, list) = get_json(&app, "/api/documents").await;
+    let ids: Vec<&str> = list["documents"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["doc_id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, [older.as_str(), newer.as_str()]);
+
+    let (status, _, _) = send(
+        &app,
+        Request::delete(format!("/api/documents/{older}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NO_CONTENT);
+    assert!(!dir.path.join(format!("{older}.pdf")).exists());
+    assert_eq!(
+        get_json(&app, &format!("/api/documents/{older}")).await.0,
+        StatusCode::NOT_FOUND
+    );
+    let (_, list) = get_json(&app, "/api/documents").await;
+    assert_eq!(list["documents"].as_array().unwrap().len(), 1);
+
+    // The Files API copy is deleted in the background.
+    for _ in 0..50 {
+        if !rec.lock().unwrap().deleted.is_empty() {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    assert_eq!(rec.lock().unwrap().deleted, ["file_test1"]);
+
+    let (status, _, _) = send(
+        &app,
+        Request::delete(format!("/api/documents/{older}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn missing_uploaded_file_is_uploaded_again() {
+    let (url, rec) = mock_claude(|n| {
+        if n == 1 {
+            (
+                StatusCode::NOT_FOUND,
+                "application/json",
+                r#"{"type":"error","error":{"type":"not_found_error","message":"File `file_test1` not found."}}"#.into(),
+            )
+        } else {
+            (StatusCode::OK, "text/event-stream", ok_stream("end_turn"))
+        }
+    })
+    .await;
+    let (app, _dir) = test_app(&url, "test-key");
+    let doc_id = upload(&app, 1).await;
+    let events = ask(&app, &doc_id).await;
+    assert_eq!(events.last().unwrap().0, "done", "{events:?}");
+    let rec = rec.lock().unwrap();
+    assert_eq!((rec.uploads, rec.calls), (2, 2));
+    assert_eq!(
+        rec.body.as_ref().unwrap()["messages"][0]["content"][0]["source"]["file_id"],
+        "file_test2"
+    );
+}
+
+#[tokio::test]
+async fn failed_upload_falls_back_to_inline_pdf() {
+    let (url, rec) =
+        mock_claude(|_| (StatusCode::OK, "text/event-stream", ok_stream("end_turn"))).await;
+    rec.lock().unwrap().uploads_fail = true;
+    let (app, _dir) = test_app(&url, "test-key");
+    let doc_id = upload(&app, 1).await;
+    let events = ask(&app, &doc_id).await;
+    assert_eq!(events.last().unwrap().0, "done");
+    let rec = rec.lock().unwrap();
+    let source = &rec.body.as_ref().unwrap()["messages"][0]["content"][0]["source"];
+    assert_eq!(source["type"], "base64");
+    assert!(!source["data"].as_str().unwrap().contains('\n'));
+}
+
+#[tokio::test]
+async fn citations_stream_as_numbered_markers_and_are_saved() {
+    let cite = |text: &str, start: u64| {
+        sse(
+            "content_block_delta",
+            json!({"type": "content_block_delta", "index": 0, "delta": {"type": "citations_delta", "citation": {
+                "type": "page_location", "cited_text": text, "document_index": 0, "document_title": null,
+                "start_page_number": start, "end_page_number": start + 1,
+            }}}),
+        )
+    };
+    let stream = [
+        sse("message_start", json!({"type": "message_start", "message": {"model": "claude-sonnet-5-5", "usage": {}}})),
+        sse("content_block_start", json!({"type": "content_block_start", "index": 0, "content_block": {"type": "text", "text": ""}})),
+        sse("content_block_delta", json!({"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "Uses softmax"}})),
+        cite("We apply a softmax.", 2),
+        cite("We apply a softmax.", 2),
+        sse("content_block_start", json!({"type": "content_block_start", "index": 1, "content_block": {"type": "text", "text": ""}})),
+        sse("content_block_delta", json!({"type": "content_block_delta", "index": 1, "delta": {"type": "text_delta", "text": " twice"}})),
+        cite("Again, softmax.", 3),
+        cite("We apply a softmax.", 2),
+        sse("message_delta", json!({"type": "message_delta", "delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 3}})),
+        sse("message_stop", json!({"type": "message_stop"})),
+    ]
+    .concat();
+    let (url, rec) =
+        mock_claude(move |_| (StatusCode::OK, "text/event-stream", stream.clone())).await;
+    let (app, _dir) = test_app(&url, "test-key");
+    let doc_id = upload(&app, 3).await;
+    let events = ask(&app, &doc_id).await;
+
+    let text: String = events
+        .iter()
+        .filter(|(e, _)| e == "delta")
+        .map(|(_, d)| d["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        text,
+        "Uses softmax[1](#cite-1) twice[2](#cite-2)[1](#cite-1)"
+    );
+    let citations: Vec<&Value> = events
+        .iter()
+        .filter(|(e, _)| e == "citation")
+        .map(|(_, d)| d)
+        .collect();
+    assert_eq!(
+        citations,
+        [
+            &json!({"n": 1, "cited_text": "We apply a softmax.", "start_page": 2, "end_page": 2}),
+            &json!({"n": 2, "cited_text": "Again, softmax.", "start_page": 3, "end_page": 3}),
+        ]
+    );
+
+    let (_, conv) = get_json(&app, &format!("/api/documents/{doc_id}/conversation")).await;
+    assert_eq!(conv["turns"][1]["content"], text.as_str());
+    assert_eq!(conv["turns"][1]["citations"].as_array().unwrap().len(), 2);
+
+    // The next question sends the earlier Answer back without its markers.
+    ask(&app, &doc_id).await;
+    let rec = rec.lock().unwrap();
+    assert_eq!(
+        rec.body.as_ref().unwrap()["messages"][1]["content"],
+        "Uses softmax twice"
+    );
+}
+
+#[tokio::test]
+async fn documents_from_older_versions_are_imported() {
+    let dir = tempdir::Dir::new();
+    let id = "0123456789abcdef0123456789abcdef";
+    std::fs::write(dir.path.join(format!("{id}.pdf")), make_pdf(2)).unwrap();
+    std::fs::write(
+        dir.path.join(format!("{id}.json")),
+        json!({"doc_id": id, "filename": "old.pdf", "page_count": 2, "size_bytes": 10, "uploaded_at": "2026-01-01T00:00:00+00:00"}).to_string(),
+    )
+    .unwrap();
+    let (app, dir) = test_app_in(dir, "http://unused", "test-key");
+    let (status, meta) = get_json(&app, &format!("/api/documents/{id}")).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(meta["filename"], "old.pdf");
+    assert!(!dir.path.join(format!("{id}.json")).exists());
 }
 
 #[tokio::test]
@@ -721,6 +1036,12 @@ async fn chat_request_validation() {
     let empty = json!({"doc_id": "f".repeat(32), "question": "   ", "current_page": 1});
     assert_eq!(
         send(&app, json_post("/api/chat", empty)).await.0,
+        StatusCode::UNPROCESSABLE_ENTITY
+    );
+
+    let long = json!({"doc_id": "f".repeat(32), "question": "hi", "current_page": 1, "selected_text": "x".repeat(20_001)});
+    assert_eq!(
+        send(&app, json_post("/api/chat", long)).await.0,
         StatusCode::UNPROCESSABLE_ENTITY
     );
 

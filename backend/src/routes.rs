@@ -1,4 +1,4 @@
-//! HTTP handlers: health, document upload/fetch, and streaming chat.
+//! HTTP handlers: health, the Document library, Conversations, and streaming chat.
 
 use std::convert::Infallible;
 use std::path::Path;
@@ -11,13 +11,13 @@ use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use futures_util::{Stream, StreamExt};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::claude::{self, Role, Turn};
+use crate::claude::{self, Citation, DocumentSource, Role, Turn};
 use crate::prompts::ReaderContext;
-use crate::storage::{DocumentMeta, StoreError};
+use crate::storage::{DocumentMeta, StoreError, StoredTurn};
 
 /// Error responses use `{"detail": "..."}`, which the frontend displays.
 #[derive(Debug)]
@@ -69,25 +69,6 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
 // ---------------------------------------------------------------------------
 // Documents
 
-#[derive(Serialize)]
-pub struct DocumentOut {
-    doc_id: String,
-    filename: String,
-    page_count: usize,
-    size_bytes: usize,
-}
-
-impl From<DocumentMeta> for DocumentOut {
-    fn from(m: DocumentMeta) -> Self {
-        Self {
-            doc_id: m.doc_id,
-            filename: m.filename,
-            page_count: m.page_count,
-            size_bytes: m.size_bytes,
-        }
-    }
-}
-
 const PDF_CONTENT_TYPES: [&str; 4] = [
     "application/pdf",
     "application/x-pdf",
@@ -122,7 +103,7 @@ fn count_pages(data: &[u8]) -> Result<usize, ApiError> {
 pub async fn upload_document(
     State(state): State<AppState>,
     mut multipart: Multipart,
-) -> ApiResult<(StatusCode, Json<DocumentOut>)> {
+) -> ApiResult<(StatusCode, Json<DocumentMeta>)> {
     let max_mb = state.settings.max_upload_mb;
     let max_bytes = state.settings.max_upload_bytes();
     let map_multipart = |e: axum::extract::multipart::MultipartError| {
@@ -203,14 +184,57 @@ pub async fn upload_document(
     }
 
     let meta = state.store.save(&data, &filename, page_count).await?;
-    Ok((StatusCode::CREATED, Json(meta.into())))
+    Ok((StatusCode::CREATED, Json(meta)))
+}
+
+pub async fn list_documents(State(state): State<AppState>) -> ApiResult<Json<Value>> {
+    Ok(Json(json!({"documents": state.store.list().await?})))
 }
 
 pub async fn get_document(
     State(state): State<AppState>,
     UrlPath(doc_id): UrlPath<String>,
-) -> ApiResult<Json<DocumentOut>> {
-    Ok(Json(state.store.get_meta(&doc_id).await?.into()))
+) -> ApiResult<Json<DocumentMeta>> {
+    Ok(Json(state.store.get_meta(&doc_id).await?))
+}
+
+/// Delete a Document, its Conversation, and its copy in the Files API (in the background).
+pub async fn delete_document(
+    State(state): State<AppState>,
+    UrlPath(doc_id): UrlPath<String>,
+) -> ApiResult<StatusCode> {
+    let file_id = state.store.delete(&doc_id).await?;
+    if let Some(file_id) = file_id
+        && state.settings.api_key_configured()
+    {
+        let (http, settings) = (state.http.clone(), state.settings.clone());
+        tokio::spawn(async move {
+            if let Err(e) = claude::delete_file(&http, &settings, &file_id).await {
+                tracing::warn!(%file_id, error = %e, "could not delete the uploaded PDF");
+            }
+        });
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---------------------------------------------------------------------------
+// Conversations
+
+pub async fn get_conversation(
+    State(state): State<AppState>,
+    UrlPath(doc_id): UrlPath<String>,
+) -> ApiResult<Json<Value>> {
+    state.store.get_meta(&doc_id).await?;
+    Ok(Json(json!({"turns": state.store.turns(&doc_id).await?})))
+}
+
+pub async fn clear_conversation(
+    State(state): State<AppState>,
+    UrlPath(doc_id): UrlPath<String>,
+) -> ApiResult<StatusCode> {
+    state.store.get_meta(&doc_id).await?;
+    state.store.clear_conversation(&doc_id).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn get_document_file(
@@ -240,14 +264,13 @@ pub async fn get_document_file(
 // ---------------------------------------------------------------------------
 // Chat
 
+/// A Question. The Conversation so far is read from storage, not sent by the browser.
 #[derive(Deserialize)]
 pub struct ChatRequest {
     doc_id: String,
     question: String,
     #[serde(flatten)]
     context: ReaderContext,
-    #[serde(default)]
-    history: Vec<Turn>,
 }
 
 fn unprocessable(msg: impl Into<String>) -> ApiError {
@@ -267,40 +290,76 @@ fn validate(req: &ChatRequest) -> ApiResult<()> {
     if req.context.current_page < 1 {
         return Err(unprocessable("current_page must be at least 1."));
     }
-    if req.history.len() > 200 {
-        return Err(unprocessable("history is too long (max 200 turns)."));
-    }
-    let too_long_selection = |c: Option<&ReaderContext>| {
-        c.and_then(|c| c.selected_text.as_ref())
-            .is_some_and(|s| s.chars().count() > 20_000)
-    };
-    if too_long_selection(Some(&req.context))
-        || req
-            .history
-            .iter()
-            .any(|t| too_long_selection(t.context.as_ref()))
+    if req
+        .context
+        .selected_text
+        .as_ref()
+        .is_some_and(|s| s.chars().count() > 20_000)
     {
         return Err(unprocessable(
             "selected_text is too long (max 20,000 characters).",
         ));
     }
-    if req
-        .history
-        .iter()
-        .any(|t| t.content.chars().count() > 100_000)
-    {
-        return Err(unprocessable(
-            "A history turn is too long (max 100,000 characters).",
-        ));
-    }
     Ok(())
+}
+
+/// A saved Turn as Claude should see it: Answers lose their citation markers.
+fn history_turn(t: StoredTurn) -> Turn {
+    let content = match t.role {
+        Role::Assistant => claude::strip_citation_markers(&t.content),
+        Role::User => t.content,
+    };
+    Turn {
+        role: t.role,
+        content,
+        context: t.context,
+    }
+}
+
+/// What the browser has been sent of the Answer so far, to save once it is done.
+#[derive(Default)]
+struct AnswerSoFar {
+    text: String,
+    citations: Vec<Citation>,
+    used_fallback: bool,
+}
+
+impl AnswerSoFar {
+    fn record(&mut self, event: &claude::OutEvent) {
+        match event.event {
+            "delta" => {
+                if let Some(t) = event.data["text"].as_str() {
+                    self.text.push_str(t);
+                }
+            }
+            "citation" => {
+                if let Ok(c) = serde_json::from_value(event.data.clone()) {
+                    self.citations.push(c);
+                }
+            }
+            "status" if event.data["state"] == "fallback" => self.used_fallback = true,
+            _ => {}
+        }
+    }
+
+    fn into_turn(self, model: Option<String>) -> StoredTurn {
+        StoredTurn {
+            role: Role::Assistant,
+            content: self.text,
+            context: None,
+            model,
+            used_fallback: self.used_fallback,
+            citations: self.citations,
+            created_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+        }
+    }
 }
 
 pub async fn chat(
     State(state): State<AppState>,
     body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
-    let settings = &state.settings;
+    let settings = state.settings.clone();
     if !settings.api_key_configured() {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -319,15 +378,82 @@ pub async fn chat(
     };
     let meta = state.store.get_meta(&req.doc_id).await.map_err(not_found)?;
     let pdf = state.store.get_pdf(&req.doc_id).await.map_err(not_found)?;
+    let history: Vec<Turn> = state
+        .store
+        .turns(&req.doc_id)
+        .await?
+        .into_iter()
+        .map(history_turn)
+        .collect();
 
+    let question_text = req.question.trim().to_string();
     let question = Turn {
         role: Role::User,
-        content: req.question.trim().to_string(),
-        context: Some(req.context),
+        content: question_text.clone(),
+        context: Some(req.context.clone()),
     };
-    let messages = claude::build_messages(&pdf, req.history, question, Some(meta.page_count));
+    let saved_question = StoredTurn::question(question_text, req.context);
 
-    let events = claude::stream_answer(state.http.clone(), (**settings).clone(), messages)
-        .map(|e| Ok(Event::default().event(e.event).data(e.data.to_string())));
+    let events = async_stream::stream! {
+        let store = &state.store;
+        let doc_id = meta.doc_id.as_str();
+        let mut file_id = meta.file_id.clone();
+        let mut reuploaded = false;
+        'request: loop {
+            if settings.use_files_api && file_id.is_none() {
+                match claude::upload_file(&state.http, &settings, pdf.clone(), &meta.filename).await {
+                    Ok(id) => {
+                        if let Err(e) = store.set_file_id(doc_id, Some(&id)).await {
+                            tracing::warn!(?e, "could not save the Files API id");
+                        }
+                        file_id = Some(id);
+                    }
+                    // Still answer: send the PDF inline this time.
+                    Err(e) => tracing::warn!(error = %e, "Files API upload failed; sending the PDF inline"),
+                }
+            }
+            let source = match &file_id {
+                Some(id) => DocumentSource::File(id),
+                None => DocumentSource::Base64(&pdf),
+            };
+            let messages = claude::build_messages(
+                claude::document_block(&source, settings.enable_citations),
+                history.clone(),
+                question.clone(),
+                Some(meta.page_count),
+            );
+
+            let answer = claude::stream_answer(state.http.clone(), (*settings).clone(), messages);
+            futures_util::pin_mut!(answer);
+            let mut so_far = AnswerSoFar::default();
+            while let Some(event) = answer.next().await {
+                if event.event == "file_missing" {
+                    let _ = store.set_file_id(doc_id, None).await;
+                    file_id = None;
+                    if !reuploaded {
+                        reuploaded = true;
+                        tracing::info!(doc_id, "uploaded PDF is gone; uploading it again");
+                        continue 'request;
+                    }
+                    yield claude::OutEvent::new("error", json!({"message": "Claude could not find the uploaded PDF. Try again."}));
+                    break 'request;
+                }
+                so_far.record(&event);
+                if event.event == "done" && !so_far.text.trim().is_empty() {
+                    let model = event.data["model"].as_str().map(str::to_string);
+                    if let Err(e) = store
+                        .append_exchange(doc_id, saved_question.clone(), so_far.into_turn(model))
+                        .await
+                    {
+                        tracing::error!(?e, "could not save the conversation");
+                    }
+                    so_far = AnswerSoFar::default();
+                }
+                yield event;
+            }
+            break;
+        }
+    }
+    .map(|e| Ok(Event::default().event(e.event).data(e.data.to_string())));
     Ok(Sse::new(events).keep_alive(KeepAlive::new().interval(Duration::from_secs(15))))
 }

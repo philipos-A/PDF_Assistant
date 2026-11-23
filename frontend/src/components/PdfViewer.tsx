@@ -10,8 +10,11 @@ import {
 } from "react";
 import { Document, Page, pdfjs } from "react-pdf";
 import type { PDFDocumentProxy } from "pdfjs-dist";
+import { usePdfSearch } from "../hooks/usePdfSearch";
 import { useTextSelection } from "../hooks/useTextSelection";
-import { FitIcon, MinusIcon, PlusIcon } from "./icons";
+import { findPassage, type ItemRange, type Mark, markItemHtml } from "../lib/textMatch";
+import type { Citation } from "../types";
+import { ChevronDownIcon, ChevronUpIcon, CloseIcon, FitIcon, MinusIcon, PlusIcon, SearchIcon } from "./icons";
 import { SelectionPopover } from "./SelectionPopover";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
@@ -24,6 +27,8 @@ const RENDER_WINDOW = 3;
 
 export interface PdfViewerHandle {
   scrollToPage: (page: number) => void;
+  /** Scroll to a cited passage and highlight it. */
+  showCitation: (citation: Citation) => void;
 }
 
 interface Props {
@@ -43,6 +48,11 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
   const pageEls = useRef<(HTMLDivElement | null)[]>([]);
   const visibleHeights = useRef(new Map<number, number>());
   const zoomAnchor = useRef<{ page: number; frac: number } | null>(null);
+  const pdfRef = useRef<PDFDocumentProxy | null>(null);
+  const pageText = useRef(new Map<number, Promise<string[]>>());
+  /** Page whose current highlight should be scrolled into view once its text layer renders. */
+  const pendingReveal = useRef<number | null>(null);
+  const searchInput = useRef<HTMLInputElement>(null);
 
   const [numPages, setNumPages] = useState(0);
   const [sizes, setSizes] = useState<PageSize[]>([]);
@@ -52,6 +62,7 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
   const [visiblePages, setVisiblePages] = useState<number[]>([1]);
   const [pageInput, setPageInput] = useState("1");
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [cited, setCited] = useState<{ page: number; ranges: ItemRange[] } | null>(null);
 
   const { selection, clear: clearSelection } = useTextSelection(scrollRef);
 
@@ -66,7 +77,24 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
     return () => ro.disconnect();
   }, []);
 
+  /** A Page's text items, as the text layer numbers them (loaded once per Page). */
+  const getPageText = useCallback((page: number): Promise<string[]> => {
+    const pdf = pdfRef.current;
+    if (!pdf) return Promise.resolve([]);
+    let text = pageText.current.get(page);
+    if (!text) {
+      text = pdf
+        .getPage(page)
+        .then((p) => p.getTextContent())
+        .then((c) => c.items.map((item) => ("str" in item ? item.str : "")));
+      pageText.current.set(page, text);
+    }
+    return text;
+  }, []);
+
   const onLoadSuccess = useCallback(async (pdf: PDFDocumentProxy) => {
+    pdfRef.current = pdf;
+    pageText.current.clear();
     setNumPages(pdf.numPages);
     setLoadError(null);
     const all = await Promise.all(
@@ -97,10 +125,84 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
     [],
   );
 
-  useImperativeHandle(ref, () => ({ scrollToPage: (p) => scrollToPage(Math.min(Math.max(1, p), numPages || p)) }), [
-    scrollToPage,
-    numPages,
-  ]);
+  const reveal = useCallback(
+    (page: number) => {
+      pendingReveal.current = page;
+      scrollToPage(page);
+    },
+    [scrollToPage],
+  );
+
+  const search = usePdfSearch(numPages, getPageText, reveal);
+
+  const showCitation = useCallback(
+    async (c: Citation) => {
+      const last = Math.min(Math.max(c.end_page, c.start_page), numPages || c.end_page);
+      for (let page = c.start_page; page <= last; page++) {
+        const ranges = findPassage(await getPageText(page), c.cited_text);
+        if (ranges) {
+          setCited({ page, ranges });
+          reveal(page);
+          return;
+        }
+      }
+      // Not found in the text layer (e.g. a scanned page): just go to the page.
+      setCited(null);
+      scrollToPage(c.start_page);
+    },
+    [getPageText, numPages, reveal, scrollToPage],
+  );
+
+  useImperativeHandle(
+    ref,
+    () => ({
+      scrollToPage: (p) => scrollToPage(Math.min(Math.max(1, p), numPages || p)),
+      showCitation: (c) => void showCitation(c),
+    }),
+    [scrollToPage, showCitation, numPages],
+  );
+
+  // Every highlight, by page and then by text item, for the text layer to draw.
+  const marks = useMemo(() => {
+    const byPage = new Map<number, Map<number, Mark[]>>();
+    const add = (page: number, ranges: ItemRange[], kind: Mark["kind"]) => {
+      let items = byPage.get(page);
+      if (!items) byPage.set(page, (items = new Map()));
+      for (const r of ranges) items.set(r.item, [...(items.get(r.item) ?? []), { ...r, kind }]);
+    };
+    search.matches.forEach((m, i) => add(m.page, m.ranges, i === search.current ? "current" : "hit"));
+    if (cited) add(cited.page, cited.ranges, "cite");
+    return byPage;
+  }, [search.matches, search.current, cited]);
+
+  const renderText = useCallback(
+    ({ pageNumber, itemIndex, str }: { pageNumber: number; itemIndex: number; str: string }) =>
+      markItemHtml(str, marks.get(pageNumber)?.get(itemIndex) ?? []),
+    [marks],
+  );
+
+  // Once a page's text layer is drawn, bring its current highlight into view.
+  const onTextLayerRendered = (page: number) => {
+    if (pendingReveal.current !== page) return;
+    pendingReveal.current = null;
+    const el = pageEls.current[page - 1]?.querySelector(".pdf-mark-current, .pdf-mark-cite");
+    el?.scrollIntoView({ block: "center", behavior: "smooth" });
+  };
+
+  // Cmd/Ctrl+F opens search; Escape clears a citation highlight.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "f") {
+        e.preventDefault();
+        search.setOpen(true);
+        requestAnimationFrame(() => searchInput.current?.select());
+      } else if (e.key === "Escape" && !(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement)) {
+        setCited(null);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [search.setOpen]);
 
   // Track which pages are on screen and which one holds the most screen area.
   useEffect(() => {
@@ -191,6 +293,19 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
           <span className="tabular-nums">of {numPages || "–"}</span>
         </form>
         <div className="flex items-center gap-1">
+          {!search.open && (
+            <button
+              type="button"
+              className={toolbarButton}
+              onClick={() => {
+                search.setOpen(true);
+                requestAnimationFrame(() => searchInput.current?.focus());
+              }}
+              title="Search (Ctrl+F)"
+            >
+              <SearchIcon width={16} height={16} />
+            </button>
+          )}
           <button type="button" className={toolbarButton} onClick={zoomOut} disabled={zoomIndex <= 0} title="Zoom out">
             <MinusIcon />
           </button>
@@ -211,6 +326,52 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
           </button>
         </div>
       </div>
+
+      {search.open && (
+        <div className="flex h-10 shrink-0 items-center gap-0.5 border-b border-slate-200 bg-white pl-3 pr-2 dark:border-slate-800 dark:bg-slate-900">
+          <SearchIcon width={14} height={14} className="shrink-0 text-slate-400" />
+          <input
+            ref={searchInput}
+            aria-label="Search in the PDF"
+            placeholder="Search"
+            value={search.query}
+            onChange={(e) => search.setQuery(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                e.preventDefault();
+                search.step(e.shiftKey ? -1 : 1);
+              } else if (e.key === "Escape") {
+                search.setOpen(false);
+              }
+            }}
+            className="min-w-0 flex-1 bg-transparent px-2 py-1 text-sm focus:outline-none"
+          />
+          <span className="shrink-0 px-1 text-right text-xs tabular-nums text-slate-500" aria-live="polite">
+            {search.status}
+          </span>
+          <button
+            type="button"
+            className={toolbarButton}
+            onClick={() => search.step(-1)}
+            disabled={!search.matches.length}
+            title="Previous match (Shift+Enter)"
+          >
+            <ChevronUpIcon width={16} height={16} />
+          </button>
+          <button
+            type="button"
+            className={toolbarButton}
+            onClick={() => search.step(1)}
+            disabled={!search.matches.length}
+            title="Next match (Enter)"
+          >
+            <ChevronDownIcon width={16} height={16} />
+          </button>
+          <button type="button" className={toolbarButton} onClick={() => search.setOpen(false)} title="Close search">
+            <CloseIcon width={14} height={14} />
+          </button>
+        </div>
+      )}
 
       <div ref={scrollRef} className="relative min-h-0 flex-1 overflow-auto bg-slate-200/70 dark:bg-slate-950">
         {loadError ? (
@@ -238,7 +399,13 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
                   style={{ width: pageWidth, height: heightOf(i), marginTop: PAGE_GAP }}
                 >
                   {renderSet.has(pageNumber) && sizes.length > 0 && (
-                    <Page pageNumber={pageNumber} width={pageWidth} loading={null} />
+                    <Page
+                      pageNumber={pageNumber}
+                      width={pageWidth}
+                      loading={null}
+                      customTextRenderer={marks.has(pageNumber) ? renderText : undefined}
+                      onRenderTextLayerSuccess={() => onTextLayerRendered(pageNumber)}
+                    />
                   )}
                 </div>
               );

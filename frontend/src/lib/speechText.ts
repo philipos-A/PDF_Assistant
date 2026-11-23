@@ -1,6 +1,7 @@
 /** Make markdown + LaTeX answers sound reasonable when read aloud. */
 export function markdownToSpeech(md: string): string {
   return md
+    .replace(/\[\d+\]\(#cite-\d+\)/g, "") // citation markers
     .replace(/```[\s\S]*?```/g, " (code omitted) ")
     .replace(/\$\$[\s\S]*?\$\$/g, " (equation shown on screen) ")
     .replace(/\$([^$\n]+?)\$/g, (_m, tex: string) =>

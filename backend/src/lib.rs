@@ -45,7 +45,7 @@ pub fn app(state: AppState) -> Router {
         .collect();
     let cors = CorsLayer::new()
         .allow_origin(origins)
-        .allow_methods([Method::GET, Method::POST])
+        .allow_methods([Method::GET, Method::POST, Method::DELETE])
         .allow_headers([header::CONTENT_TYPE]);
 
     // Leave headroom over the file limit for multipart framing; the handler
@@ -59,14 +59,23 @@ pub fn app(state: AppState) -> Router {
         .route("/api/health", get(routes::health))
         .route(
             "/api/documents",
-            post(routes::upload_document).layer(DefaultBodyLimit::max(upload_limit)),
+            get(routes::list_documents)
+                .post(routes::upload_document)
+                .layer(DefaultBodyLimit::max(upload_limit)),
         )
-        .route("/api/documents/{doc_id}", get(routes::get_document))
+        .route(
+            "/api/documents/{doc_id}",
+            get(routes::get_document).delete(routes::delete_document),
+        )
+        .route(
+            "/api/documents/{doc_id}/conversation",
+            get(routes::get_conversation).delete(routes::clear_conversation),
+        )
         .route(
             "/api/documents/{doc_id}/file",
             get(routes::get_document_file),
         )
-        // Chat bodies carry history and selections, not the PDF.
+        // Chat bodies carry a Question and its Reader Context, not the PDF.
         .route(
             "/api/chat",
             post(routes::chat).layer(DefaultBodyLimit::max(8 * 1024 * 1024)),

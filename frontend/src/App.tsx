@@ -4,7 +4,7 @@ import { ChatPanel, type SelectionRequest } from "./components/ChatPanel";
 import { ChatIcon, FileIcon } from "./components/icons";
 import { PdfViewer, type PdfViewerHandle } from "./components/PdfViewer";
 import { UploadView } from "./components/UploadView";
-import type { DocInfo, Health } from "./types";
+import type { Citation, DocInfo, Health } from "./types";
 
 const DOC_KEY = "pdf-assistant:doc";
 const WIDTH_KEY = "pdf-assistant:chat-width";
@@ -69,6 +69,7 @@ export default function App() {
   }, []);
 
   const goToPage = useCallback((page: number) => viewerRef.current?.scrollToPage(page), []);
+  const showCitation = useCallback((c: Citation) => viewerRef.current?.showCitation(c), []);
 
   const onAskAboutSelection = useCallback((text: string, page: number | null) => {
     setChatOpen(true);
@@ -111,7 +112,7 @@ export default function App() {
       <div className="flex h-full flex-col">
         {banner}
         <main className="min-h-0 flex-1 overflow-auto">
-          {restoring ? null : <UploadView health={health} onUploaded={openDoc} />}
+          {restoring ? null : <UploadView health={health} onOpen={openDoc} />}
         </main>
       </div>
     );
@@ -145,7 +146,7 @@ export default function App() {
             onClick={() => openDoc(null)}
             className="rounded-md px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100 dark:text-slate-300 dark:hover:bg-slate-800"
           >
-            Open another PDF
+            Library
           </button>
         </div>
       </header>
@@ -153,6 +154,7 @@ export default function App() {
       <main className="flex min-h-0 flex-1 flex-col md:flex-row">
         <section className="min-h-0 min-w-0 flex-1">
           <PdfViewer
+            key={doc.doc_id}
             ref={viewerRef}
             fileUrl={documentFileUrl(doc.doc_id)}
             onPageChange={onPageChange}
@@ -179,6 +181,7 @@ export default function App() {
                 visiblePages={visiblePages}
                 selectionRequest={selectionRequest}
                 onPageClick={goToPage}
+                onCitationClick={showCitation}
                 onCollapse={() => setChatOpen(false)}
               />
             </aside>

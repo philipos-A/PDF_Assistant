@@ -3,15 +3,56 @@ import ReactMarkdown, { type Components } from "react-markdown";
 import rehypeKatex from "rehype-katex";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
+import { citationPages, parseCiteHref } from "../lib/citations";
 import { linkifyPageRefs, parsePageHref } from "../lib/pageRefs";
-import type { ChatMessage } from "../types";
+import type { ChatMessage, Citation } from "../types";
 import { SpeakerIcon } from "./icons";
 
 interface Props {
   message: ChatMessage;
   pageCount: number;
   onPageClick: (page: number) => void;
+  /** Show a cited passage in the PDF. */
+  onCitationClick: (citation: Citation) => void;
   onSpeak?: (text: string) => void;
+}
+
+function CitationChip({ citation, onClick }: { citation: Citation; onClick: (c: Citation) => void }) {
+  return (
+    <button
+      type="button"
+      onClick={() => onClick(citation)}
+      title={`${citationPages(citation)}: “${citation.cited_text}”`}
+      aria-label={`Source ${citation.n}, ${citationPages(citation)}`}
+      className="mx-0.5 inline-grid h-4 min-w-4 -translate-y-1 place-items-center rounded bg-amber-100 px-1 align-baseline text-[10px] font-semibold leading-none text-amber-800 no-underline transition hover:bg-amber-200 dark:bg-amber-900/60 dark:text-amber-200 dark:hover:bg-amber-800"
+    >
+      {citation.n}
+    </button>
+  );
+}
+
+function CitationList({ citations, onClick }: { citations: Citation[]; onClick: (c: Citation) => void }) {
+  return (
+    <div className="mt-3 border-t border-slate-100 pt-2 dark:border-slate-800">
+      <div className="mb-1 text-[11px] font-semibold uppercase tracking-wide text-slate-400">Sources</div>
+      <ol className="space-y-1">
+        {citations.map((c) => (
+          <li key={c.n}>
+            <button
+              type="button"
+              onClick={() => onClick(c)}
+              className="flex w-full gap-2 rounded-md px-1.5 py-1 text-left text-xs text-slate-600 transition hover:bg-amber-50 dark:text-slate-300 dark:hover:bg-amber-950/40"
+            >
+              <span className="shrink-0 font-semibold text-amber-700 dark:text-amber-300">
+                {c.n} · {citationPages(c)}
+              </span>
+              <span className="line-clamp-2 italic">“{c.cited_text}”</span>
+            </button>
+          </li>
+        ))}
+      </ol>
+    </div>
+  );
 }
 
 function PageBadge({ page, onClick }: { page: number; onClick: (p: number) => void }) {
@@ -27,10 +68,17 @@ function PageBadge({ page, onClick }: { page: number; onClick: (p: number) => vo
   );
 }
 
-export const Message = memo(function Message({ message, pageCount, onPageClick, onSpeak }: Props) {
+export const Message = memo(function Message({ message, pageCount, onPageClick, onCitationClick, onSpeak }: Props) {
+  const citations = message.citations;
   const components = useMemo<Components>(
     () => ({
       a: ({ href, children }) => {
+        const n = parseCiteHref(href);
+        if (n !== null) {
+          const citation = citations?.find((c) => c.n === n);
+          // The backend sends each citation before its first marker; drop a marker with none.
+          return citation ? <CitationChip citation={citation} onClick={onCitationClick} /> : null;
+        }
         const page = parsePageHref(href);
         if (page !== null) {
           return (
@@ -50,7 +98,7 @@ export const Message = memo(function Message({ message, pageCount, onPageClick, 
         );
       },
     }),
-    [onPageClick],
+    [onPageClick, onCitationClick, citations],
   );
 
   if (message.role === "user") {
@@ -97,6 +145,9 @@ export const Message = memo(function Message({ message, pageCount, onPageClick, 
               <span className="ml-0.5 inline-block h-4 w-1.5 translate-y-0.5 animate-pulse rounded-sm bg-indigo-400" />
             )}
           </div>
+        )}
+        {message.status === "done" && citations && citations.length > 0 && (
+          <CitationList citations={citations} onClick={onCitationClick} />
         )}
         {message.status === "error" && (
           <p className="mt-2 rounded-md bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/50 dark:text-red-300">

@@ -88,3 +88,24 @@ export const SparkIcon = (p: P) => (
     <path d="M12 3v4M12 17v4M3 12h4M17 12h4M6 6l2.5 2.5M15.5 15.5 18 18M6 18l2.5-2.5M15.5 8.5 18 6" />
   </svg>
 );
+export const SearchIcon = (p: P) => (
+  <svg {...base} {...p}>
+    <circle cx="11" cy="11" r="7" />
+    <path d="m20 20-3.5-3.5" />
+  </svg>
+);
+export const ChevronUpIcon = (p: P) => (
+  <svg {...base} {...p}>
+    <path d="m6 15 6-6 6 6" />
+  </svg>
+);
+export const ChevronDownIcon = (p: P) => (
+  <svg {...base} {...p}>
+    <path d="m6 9 6 6 6-6" />
+  </svg>
+);
+export const TrashIcon = (p: P) => (
+  <svg {...base} {...p}>
+    <path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3" />
+  </svg>
+);

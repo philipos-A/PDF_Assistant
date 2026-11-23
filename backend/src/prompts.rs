@@ -1,6 +1,6 @@
 //! System prompt and per-question reader context.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 pub const SYSTEM_PROMPT: &str = "\
 You are a patient reading companion helping someone work through a dense \
@@ -34,14 +34,14 @@ as needed. Use short paragraphs, and lists where they help.
 
 /// Where the reader is when they ask a question: the page they're on, the pages on
 /// screen, and any text they've selected (with the page it came from).
-#[derive(Clone, Debug, Default, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 pub struct ReaderContext {
     pub current_page: u32,
     #[serde(default)]
     pub visible_pages: Vec<u32>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected_text: Option<String>,
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_page: Option<u32>,
 }
 

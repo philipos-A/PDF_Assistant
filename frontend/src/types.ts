@@ -1,8 +1,33 @@
+/** A Document as the library lists it. */
 export interface DocInfo {
   doc_id: string;
   filename: string;
   page_count: number;
   size_bytes: number;
+  uploaded_at: string;
+  /** Time of the latest Turn, or the upload time. */
+  last_active_at: string;
+  question_count: number;
+}
+
+/** A passage an Answer cites. `n` matches the `[n](#cite-n)` marker in the Answer. */
+export interface Citation {
+  n: number;
+  cited_text: string;
+  start_page: number;
+  /** Last page of the passage (inclusive). */
+  end_page: number;
+}
+
+/** A saved Turn, as `GET /api/documents/{id}/conversation` returns it. */
+export interface StoredTurn {
+  role: "user" | "assistant";
+  content: string;
+  context: ReaderContext | null;
+  model: string | null;
+  used_fallback: boolean;
+  citations: Citation[];
+  created_at: string;
 }
 
 export interface Health {
@@ -36,14 +61,12 @@ export interface ChatMessage {
   error?: string;
   /** Set when a fallback model answered instead of the configured one. */
   usedFallback?: boolean;
+  /** Answers: the passages its `[n](#cite-n)` markers point to. */
+  citations?: Citation[];
 }
 
-export type HistoryTurn =
-  | ({ role: "user"; content: string } & ReaderContext)
-  | { role: "assistant"; content: string };
-
+/** A Question. The backend keeps the Conversation, so no history is sent. */
 export interface ChatRequest extends ReaderContext {
   doc_id: string;
   question: string;
-  history: HistoryTurn[];
 }

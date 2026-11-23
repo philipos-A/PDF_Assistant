@@ -1,4 +1,4 @@
-import type { ChatRequest, DocInfo, Health } from "./types";
+import type { ChatRequest, Citation, DocInfo, Health, StoredTurn } from "./types";
 
 async function errorMessage(res: Response): Promise<string> {
   try {
@@ -32,11 +32,35 @@ export async function getDocument(docId: string): Promise<DocInfo | null> {
   return res.json();
 }
 
+export async function listDocuments(): Promise<DocInfo[]> {
+  const res = await fetch("/api/documents");
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return (await res.json()).documents;
+}
+
+export async function deleteDocument(docId: string): Promise<void> {
+  const res = await fetch(`/api/documents/${encodeURIComponent(docId)}`, { method: "DELETE" });
+  if (!res.ok && res.status !== 404) throw new Error(await errorMessage(res));
+}
+
+export async function getConversation(docId: string): Promise<StoredTurn[]> {
+  const res = await fetch(`/api/documents/${encodeURIComponent(docId)}/conversation`);
+  if (!res.ok) throw new Error(await errorMessage(res));
+  return (await res.json()).turns;
+}
+
+export async function clearConversation(docId: string): Promise<void> {
+  const res = await fetch(`/api/documents/${encodeURIComponent(docId)}/conversation`, { method: "DELETE" });
+  if (!res.ok) throw new Error(await errorMessage(res));
+}
+
 export const documentFileUrl = (docId: string) => `/api/documents/${encodeURIComponent(docId)}/file`;
 
 export interface StreamHandlers {
   onStatus?: (state: "thinking" | "writing" | "fallback") => void;
   onDelta: (text: string) => void;
+  /** A newly cited passage; its marker arrives in a later delta. */
+  onCitation?: (citation: Citation) => void;
   onDone?: (info: { stop_reason: string; model: string }) => void;
   /** `refused` is true when Claude declined; any partial answer should be discarded. */
   onError: (message: string, info: { refused: boolean }) => void;
@@ -93,6 +117,9 @@ export async function streamChat(req: ChatRequest, handlers: StreamHandlers, sig
         break;
       case "delta":
         handlers.onDelta(payload.text);
+        break;
+      case "citation":
+        handlers.onCitation?.(payload);
         break;
       case "done":
         finished = true;

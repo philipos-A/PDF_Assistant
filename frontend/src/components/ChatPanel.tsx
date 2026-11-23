@@ -1,8 +1,9 @@
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { streamChat } from "../api";
+import { clearConversation, getConversation, streamChat } from "../api";
+import { turnsToMessages } from "../lib/citations";
 import { useSpeechRecognition } from "../hooks/useSpeechRecognition";
 import { useSpeechSynthesis } from "../hooks/useSpeechSynthesis";
-import type { ChatMessage, DocInfo, HistoryTurn, ReaderContext } from "../types";
+import type { ChatMessage, Citation, DocInfo, ReaderContext } from "../types";
 import { CloseIcon, SendIcon, SpeakerIcon, SpeakerOffIcon, StopIcon } from "./icons";
 import { Message } from "./Message";
 import { MicButton } from "./MicButton";
@@ -20,6 +21,7 @@ interface Props {
   visiblePages: number[];
   selectionRequest: SelectionRequest | null;
   onPageClick: (page: number) => void;
+  onCitationClick: (citation: Citation) => void;
   onCollapse: () => void;
 }
 
@@ -31,18 +33,19 @@ const SUGGESTIONS = [
 
 const uid = () => Math.random().toString(36).slice(2);
 
-function toHistory(messages: ChatMessage[]): HistoryTurn[] {
-  return messages
-    .filter((m) => m.status === "done" && m.content.trim())
-    .map((m): HistoryTurn =>
-      m.role === "user"
-        ? { role: "user", content: m.content, ...(m.context ?? { current_page: m.page, visible_pages: [] }) }
-        : { role: "assistant", content: m.content },
-    );
-}
-
-export function ChatPanel({ doc, currentPage, visiblePages, selectionRequest, onPageClick, onCollapse }: Props) {
+export function ChatPanel({
+  doc,
+  currentPage,
+  visiblePages,
+  selectionRequest,
+  onPageClick,
+  onCitationClick,
+  onCollapse,
+}: Props) {
   const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [confirmClear, setConfirmClear] = useState(false);
   const [input, setInput] = useState("");
   const [attached, setAttached] = useState<{ text: string; page: number | null } | null>(null);
   const [readAloud, setReadAloud] = useState(() => {
@@ -66,7 +69,7 @@ export function ChatPanel({ doc, currentPage, visiblePages, selectionRequest, on
 
   const send = useCallback(
     async (raw: string) => {
-      if (busy) return;
+      if (busy || loading) return;
       let question = raw.trim();
       if (!question && attached) question = "Explain this passage in plain language.";
       if (!question) return;
@@ -93,7 +96,6 @@ export function ChatPanel({ doc, currentPage, visiblePages, selectionRequest, on
         page: currentPage,
         status: "pending",
       };
-      const history = toHistory(messages);
       setMessages((ms) => [...ms, userMsg, assistantMsg]);
       setInput("");
       setAttached(null);
@@ -104,12 +106,14 @@ export function ChatPanel({ doc, currentPage, visiblePages, selectionRequest, on
       abortRef.current = controller;
       let answer = "";
       await streamChat(
-        { doc_id: doc.doc_id, question, ...context, history },
+        { doc_id: doc.doc_id, question, ...context },
         {
           onStatus: (state) => {
             if (state === "thinking") update(assistantId, (m) => (m.content ? {} : { status: "thinking" }));
             if (state === "fallback") update(assistantId, { usedFallback: true });
           },
+          onCitation: (citation) =>
+            update(assistantId, (m) => ({ citations: [...(m.citations ?? []), citation] })),
           onDelta: (text) => {
             answer += text;
             update(assistantId, { content: answer, status: "streaming" });
@@ -129,7 +133,7 @@ export function ChatPanel({ doc, currentPage, visiblePages, selectionRequest, on
       }
       abortRef.current = null;
     },
-    [busy, attached, currentPage, visiblePages, messages, doc.doc_id, readAloud],
+    [busy, loading, attached, currentPage, visiblePages, doc.doc_id, readAloud],
   );
 
   const speech = useSpeechRecognition((transcript) => {
@@ -145,6 +149,36 @@ export function ChatPanel({ doc, currentPage, visiblePages, selectionRequest, on
   }, [selectionRequest]);
 
   useEffect(() => () => abortRef.current?.abort(), []);
+
+  // Reopen the Document's saved Conversation.
+  useEffect(() => {
+    let cancelled = false;
+    getConversation(doc.doc_id)
+      .then((turns) => {
+        if (!cancelled) setMessages(turnsToMessages(turns));
+      })
+      .catch((e: Error) => {
+        if (!cancelled) setLoadError(`Could not load earlier questions: ${e.message}`);
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [doc.doc_id]);
+
+  const clear = async () => {
+    setConfirmClear(false);
+    try {
+      await clearConversation(doc.doc_id);
+      setMessages([]);
+      setLoadError(null);
+      tts.cancel();
+    } catch (e) {
+      setLoadError((e as Error).message);
+    }
+  };
 
   // Auto-scroll while streaming, unless the reader scrolled up.
   useLayoutEffect(() => {
@@ -178,6 +212,34 @@ export function ChatPanel({ doc, currentPage, visiblePages, selectionRequest, on
       <div className="flex h-11 shrink-0 items-center justify-between border-b border-slate-200 bg-white px-3 dark:border-slate-800 dark:bg-slate-900">
         <div className="text-sm font-semibold">Ask about the paper</div>
         <div className="flex items-center gap-1">
+          {messages.length > 0 && !busy &&
+            (confirmClear ? (
+              <span className="flex items-center gap-1 text-xs">
+                <button
+                  type="button"
+                  onClick={() => void clear()}
+                  className="h-8 rounded-md bg-red-600 px-2 font-medium text-white hover:bg-red-500"
+                >
+                  Clear all
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmClear(false)}
+                  className="h-8 rounded-md px-2 text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+                >
+                  Keep
+                </button>
+              </span>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmClear(true)}
+                title="Delete this paper's questions and answers"
+                className="h-8 rounded-md px-2 text-xs text-slate-500 hover:bg-slate-100 dark:hover:bg-slate-800"
+              >
+                Clear
+              </button>
+            ))}
           {tts.supported && (
             <button
               type="button"
@@ -222,7 +284,13 @@ export function ChatPanel({ doc, currentPage, visiblePages, selectionRequest, on
         }}
         className="min-h-0 flex-1 space-y-5 overflow-y-auto px-4 py-4"
       >
-        {messages.length === 0 && (
+        {loadError && (
+          <p className="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/50 dark:text-red-300">
+            {loadError}
+          </p>
+        )}
+        {loading && <p className="mt-6 text-center text-sm text-slate-400">Loading earlier questions…</p>}
+        {!loading && messages.length === 0 && (
           <div className="mt-6 space-y-4 text-center">
             <p className="text-sm text-slate-500">
               Ask anything about <span className="font-medium text-slate-700 dark:text-slate-300">{doc.filename}</span>.
@@ -248,6 +316,7 @@ export function ChatPanel({ doc, currentPage, visiblePages, selectionRequest, on
             message={m}
             pageCount={doc.page_count}
             onPageClick={onPageClick}
+            onCitationClick={onCitationClick}
             onSpeak={tts.supported ? tts.speak : undefined}
           />
         ))}

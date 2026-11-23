@@ -12,6 +12,10 @@ _Avoid_: Paper, file, DocInfo
 The opaque identifier the backend assigns to a Document on upload.
 _Avoid_: doc key, file id
 
+**Library**:
+Every Document the Reader has uploaded, with its Conversation, most recently active first.
+_Avoid_: History, recent files
+
 **Page**:
 A single 1-based page of a Document, numbered as the PDF numbers it (not as printed in the paper).
 _Avoid_: Slide, sheet
@@ -52,12 +56,16 @@ One Question or one Answer in the Conversation, with the Reader Context it was a
 _Avoid_: HistoryTurn, ChatMessage, message
 
 **Conversation**:
-The ordered Turns about one Document. Sent back as history with each new Question.
+The ordered Turns about one Document. The backend saves each Question with its Answer once the Answer is done, and sends the saved Turns back to Claude with each new Question.
 _Avoid_: Chat, thread, session
 
 **Page Reference**:
-A mention of a Page in an Answer ("p. 4", "pp. 5–6", "page 12") that the Reader can follow to that Page.
-_Avoid_: Citation, page link
+A mention of a Page in an Answer ("p. 4", "pp. 5–6", "page 12") that the Reader can follow to that Page. Claude writes these as text; compare Citation.
+_Avoid_: page link
+
+**Citation**:
+A passage of the Document that the API reports an Answer relies on, with the Pages it is on. Numbered within its Answer and shown as a chip; following one highlights the passage.
+_Avoid_: Source, quote, reference
 
 **Fallback**:
 An Answer produced by the backup model because the configured model was unavailable.

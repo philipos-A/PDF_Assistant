@@ -8,6 +8,10 @@ describe("markdownToSpeech", () => {
     );
   });
 
+  it("drops citation markers", () => {
+    expect(markdownToSpeech("Softmax[1](#cite-1)[2](#cite-2) is used.")).toBe("Softmax is used.");
+  });
+
   it("replaces display math and code blocks with a spoken note", () => {
     expect(markdownToSpeech("$$x^2$$")).toBe("(equation shown on screen)");
     expect(markdownToSpeech("```\nlet x = 1;\n```")).toBe("(code omitted)");
