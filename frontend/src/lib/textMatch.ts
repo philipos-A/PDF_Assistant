@@ -11,14 +11,23 @@ export interface ItemRange {
   end: number;
 }
 
-/** A highlight to draw: search hits, the current hit, or a cited passage. */
-export type MarkKind = "hit" | "current" | "cite";
+/**
+ * A highlight to draw: search hits, the current hit, the cited passage being
+ * shown, or a Marked Passage the Reader asked about ("asked") or an Answer cited ("noted").
+ */
+export type MarkKind = "hit" | "current" | "cite" | "asked" | "noted";
 
 export interface Mark extends ItemRange {
   kind: MarkKind;
+  /** Key of the Marked Passage this mark belongs to; clicking it shows its Answers. */
+  passage?: string;
+  /** Highlighter sweep: start after `delay` ms (negative = already part-way) and take `duration` ms. */
+  sweep?: { delay: number; duration: number };
 }
 
-const SKIP = /[\s­\-‐-―]/;
+// Whitespace, hyphens and dashes, and control characters: PDF text extraction can turn a
+// line-break hyphen into one (e.g. "in\u0002tegrability" in a Citation's cited_text).
+const SKIP = /[\s\p{Cc}­\-‐-―]/u;
 const QUOTES: Record<string, string> = { "‘": "'", "’": "'", "“": '"', "”": '"' };
 
 function normalizeChar(ch: string): string {
@@ -111,7 +120,11 @@ export function markItemHtml(str: string, marks: Mark[]): string {
     const end = Math.min(m.end, str.length);
     if (start >= end) continue;
     html += escapeHtml(str.slice(pos, start));
-    html += `<mark class="pdf-mark pdf-mark-${m.kind}">${escapeHtml(str.slice(start, end))}</mark>`;
+    const passage = m.passage ? ` data-passage="${escapeHtml(m.passage)}"` : "";
+    const sweep = m.sweep
+      ? ` data-sweep style="--sweep-delay:${Math.round(m.sweep.delay)}ms;--sweep-duration:${Math.round(m.sweep.duration)}ms"`
+      : "";
+    html += `<mark class="pdf-mark pdf-mark-${m.kind}"${passage}${sweep}>${escapeHtml(str.slice(start, end))}</mark>`;
     pos = end;
   }
   return html + escapeHtml(str.slice(pos));

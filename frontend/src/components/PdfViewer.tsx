@@ -1,4 +1,5 @@
 import {
+  memo,
   type Ref,
   useCallback,
   useEffect,
@@ -12,9 +13,19 @@ import { Document, Page, pdfjs } from "react-pdf";
 import type { PDFDocumentProxy } from "pdfjs-dist";
 import { usePdfSearch } from "../hooks/usePdfSearch";
 import { useTextSelection } from "../hooks/useTextSelection";
+import { citationKey, type MarkedPassage } from "../lib/passages";
 import { findPassage, type ItemRange, type Mark, markItemHtml } from "../lib/textMatch";
 import type { Citation } from "../types";
-import { ChevronDownIcon, ChevronUpIcon, CloseIcon, FitIcon, MinusIcon, PlusIcon, SearchIcon } from "./icons";
+import {
+  ChevronDownIcon,
+  ChevronUpIcon,
+  CloseIcon,
+  FitIcon,
+  HighlighterIcon,
+  MinusIcon,
+  PlusIcon,
+  SearchIcon,
+} from "./icons";
 import { SelectionPopover } from "./SelectionPopover";
 
 pdfjs.GlobalWorkerOptions.workerSrc = new URL("pdfjs-dist/build/pdf.worker.min.mjs", import.meta.url).toString();
@@ -24,10 +35,43 @@ const PAGE_GAP = 16;
 const SIDE_PADDING = 48;
 /** Pages rendered above/below the current one; the rest are sized placeholders. */
 const RENDER_WINDOW = 3;
+/** Highlighter sweep speed, and the shortest and longest a whole passage takes. */
+const SWEEP_MS_PER_CHAR = 14;
+const SWEEP_MIN_MS = 350;
+const SWEEP_MAX_MS = 1600;
+const PASSAGES_KEY = "pdf-assistant:show-passages";
+
+/** Where a passage was found: its Page and text-layer ranges. */
+interface Located {
+  page: number;
+  ranges: ItemRange[];
+}
+
+/** Ranges in reading order → per-range sweep start and length (ms), so the highlighter crosses lines in turn. */
+function planSweep(ranges: ItemRange[]): { start: number; duration: number }[] {
+  const total = ranges.reduce((n, r) => n + (r.end - r.start), 0) || 1;
+  const scale = Math.min(SWEEP_MAX_MS, Math.max(SWEEP_MIN_MS, total * SWEEP_MS_PER_CHAR)) / total;
+  let at = 0;
+  return ranges.map((r) => {
+    const duration = (r.end - r.start) * scale;
+    const plan = { start: at, duration };
+    at += duration;
+    return plan;
+  });
+}
+
+function loadFlag(key: string, fallback: boolean): boolean {
+  try {
+    const v = localStorage.getItem(key);
+    return v === null ? fallback : v === "1";
+  } catch {
+    return fallback;
+  }
+}
 
 export interface PdfViewerHandle {
   scrollToPage: (page: number) => void;
-  /** Scroll to a cited passage and highlight it. */
+  /** Scroll to a cited passage and sweep a highlight across it. */
   showCitation: (citation: Citation) => void;
 }
 
@@ -36,6 +80,9 @@ interface Props {
   ref?: Ref<PdfViewerHandle>;
   onPageChange: (current: number, visible: number[]) => void;
   onAskAboutSelection: (text: string, page: number | null) => void;
+  /** Passages to keep marked; clicking one calls onPassageClick. */
+  passages?: MarkedPassage[];
+  onPassageClick?: (key: string, rect: DOMRect) => void;
 }
 
 interface PageSize {
@@ -43,7 +90,20 @@ interface PageSize {
   h: number;
 }
 
-export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: Props) {
+const NO_PASSAGES: MarkedPassage[] = [];
+
+/**
+ * Memoized: the App re-renders on every streamed word of an Answer, which this
+ * viewer (one element per Page) doesn't need to follow.
+ */
+export const PdfViewer = memo(function PdfViewer({
+  fileUrl,
+  ref,
+  onPageChange,
+  onAskAboutSelection,
+  passages = NO_PASSAGES,
+  onPassageClick,
+}: Props) {
   const scrollRef = useRef<HTMLDivElement>(null);
   const pageEls = useRef<(HTMLDivElement | null)[]>([]);
   const visibleHeights = useRef(new Map<number, number>());
@@ -62,7 +122,13 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
   const [visiblePages, setVisiblePages] = useState<number[]>([1]);
   const [pageInput, setPageInput] = useState("1");
   const [loadError, setLoadError] = useState<string | null>(null);
-  const [cited, setCited] = useState<{ page: number; ranges: ItemRange[] } | null>(null);
+  /** The cited passage being shown, and when its highlighter sweep started. */
+  const [cited, setCited] = useState<(Located & { key: string; startedAt: number }) | null>(null);
+  const [located, setLocated] = useState<Map<string, Located>>(new Map());
+  const [showPassages, setShowPassages] = useState(() => loadFlag(PASSAGES_KEY, true));
+  const renderSetRef = useRef<Set<number>>(new Set());
+  /** Latest showCitation call; an older one that finishes later must not replace its highlight. */
+  const citationRequest = useRef(0);
 
   const { selection, clear: clearSelection } = useTextSelection(scrollRef);
 
@@ -115,20 +181,19 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
     [sizes, pageWidth],
   );
 
-  const scrollToPage = useCallback(
-    (page: number, smooth = true) => {
-      const el = pageEls.current[page - 1];
-      const container = scrollRef.current;
-      if (!el || !container) return;
-      container.scrollTo({ top: el.offsetTop - PAGE_GAP, behavior: smooth ? "smooth" : "auto" });
-    },
-    [],
-  );
+  const scrollToPage = useCallback((page: number, smooth = true) => {
+    const el = pageEls.current[page - 1];
+    const container = scrollRef.current;
+    if (!el || !container) return;
+    container.scrollTo({ top: el.offsetTop - PAGE_GAP, behavior: smooth ? "smooth" : "auto" });
+  }, []);
 
   const reveal = useCallback(
     (page: number) => {
       pendingReveal.current = page;
-      scrollToPage(page);
+      // A rendered page redraws its text layer for the new highlight, which then scrolls it into
+      // view; jumping to the page top first would make the view lurch.
+      if (!renderSetRef.current.has(page)) scrollToPage(page);
     },
     [scrollToPage],
   );
@@ -137,11 +202,13 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
 
   const showCitation = useCallback(
     async (c: Citation) => {
+      const request = ++citationRequest.current;
       const last = Math.min(Math.max(c.end_page, c.start_page), numPages || c.end_page);
       for (let page = c.start_page; page <= last; page++) {
         const ranges = findPassage(await getPageText(page), c.cited_text);
+        if (request !== citationRequest.current) return;
         if (ranges) {
-          setCited({ page, ranges });
+          setCited({ page, ranges, key: citationKey(c), startedAt: performance.now() });
           reveal(page);
           return;
         }
@@ -162,24 +229,104 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
     [scrollToPage, showCitation, numPages],
   );
 
+  // Find each Marked Passage in the text layer (only when the set of passages changes).
+  const passageSig = passages.map((p) => p.key).join("\n");
+  useEffect(() => {
+    if (!numPages) return;
+    let cancelled = false;
+    void (async () => {
+      const found = new Map<string, Located>();
+      for (const p of passages) {
+        for (let page = p.startPage; page <= Math.min(p.endPage, numPages); page++) {
+          const ranges = findPassage(await getPageText(page), p.text);
+          if (ranges) {
+            found.set(p.key, { page, ranges });
+            break;
+          }
+        }
+      }
+      if (!cancelled) setLocated(found);
+    })();
+    return () => {
+      cancelled = true;
+    };
+    // passageSig stands for `passages`, so a new array with the same passages does not re-run this.
+  }, [passageSig, numPages, getPageText]);
+
   // Every highlight, by page and then by text item, for the text layer to draw.
+  // Earlier ones win where they overlap: search, then the cited passage, then Marked Passages.
   const marks = useMemo(() => {
     const byPage = new Map<number, Map<number, Mark[]>>();
-    const add = (page: number, ranges: ItemRange[], kind: Mark["kind"]) => {
+    const add = (page: number, ranges: ItemRange[], mark: (r: ItemRange, i: number) => Mark) => {
       let items = byPage.get(page);
       if (!items) byPage.set(page, (items = new Map()));
-      for (const r of ranges) items.set(r.item, [...(items.get(r.item) ?? []), { ...r, kind }]);
+      ranges.forEach((r, i) => items.set(r.item, [...(items.get(r.item) ?? []), mark(r, i)]));
     };
-    search.matches.forEach((m, i) => add(m.page, m.ranges, i === search.current ? "current" : "hit"));
-    if (cited) add(cited.page, cited.ranges, "cite");
+    search.matches.forEach((m, i) =>
+      add(m.page, m.ranges, (r) => ({ ...r, kind: i === search.current ? "current" : "hit" })),
+    );
+    if (cited) {
+      const plan = planSweep(cited.ranges);
+      const passage = located.has(cited.key) ? cited.key : undefined;
+      // `sweep.delay` is relative to the sweep's start here; renderText makes it relative to now.
+      add(cited.page, cited.ranges, (r, i) => ({
+        ...r,
+        kind: "cite",
+        passage,
+        sweep: { delay: plan[i].start, duration: plan[i].duration },
+      }));
+    }
+    if (showPassages) {
+      const kindOf = new Map(passages.map((p) => [p.key, p.kind]));
+      for (const [key, loc] of located) {
+        if (key === cited?.key) continue;
+        add(loc.page, loc.ranges, (r) => ({
+          ...r,
+          kind: kindOf.get(key) === "asked" ? "asked" : "noted",
+          passage: key,
+        }));
+      }
+    }
     return byPage;
-  }, [search.matches, search.current, cited]);
+  }, [search.matches, search.current, cited, located, showPassages, passages]);
 
   const renderText = useCallback(
-    ({ pageNumber, itemIndex, str }: { pageNumber: number; itemIndex: number; str: string }) =>
-      markItemHtml(str, marks.get(pageNumber)?.get(itemIndex) ?? []),
-    [marks],
+    ({ pageNumber, itemIndex, str }: { pageNumber: number; itemIndex: number; str: string }) => {
+      const itemMarks = marks.get(pageNumber)?.get(itemIndex) ?? [];
+      // The text layer is redrawn whenever any highlight changes. Offsetting the sweep by the time
+      // since it started lets a redrawn sweep carry on where it was instead of starting over.
+      const elapsed = cited ? performance.now() - cited.startedAt : 0;
+      return markItemHtml(
+        str,
+        itemMarks.map((m) => {
+          if (!m.sweep) return m;
+          const delay = m.sweep.delay - elapsed;
+          return delay + m.sweep.duration <= 0 ? { ...m, sweep: undefined } : { ...m, sweep: { ...m.sweep, delay } };
+        }),
+      );
+    },
+    [marks, cited],
   );
+
+  const toggleShowPassages = () => {
+    setShowPassages((v) => {
+      try {
+        localStorage.setItem(PASSAGES_KEY, v ? "0" : "1");
+      } catch {
+        /* storage unavailable */
+      }
+      return !v;
+    });
+  };
+
+  // Clicking a Marked Passage (without selecting text) shows its saved Answers.
+  const onViewerClick = (e: React.MouseEvent) => {
+    const mark = (e.target as Element).closest?.<HTMLElement>("mark[data-passage]");
+    if (!mark || !onPassageClick) return;
+    const sel = window.getSelection();
+    if (sel && !sel.isCollapsed) return;
+    onPassageClick(mark.dataset.passage!, mark.getBoundingClientRect());
+  };
 
   // Once a page's text layer is drawn, bring its current highlight into view.
   const onTextLayerRendered = (page: number) => {
@@ -196,7 +343,11 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
         e.preventDefault();
         search.setOpen(true);
         requestAnimationFrame(() => searchInput.current?.select());
-      } else if (e.key === "Escape" && !(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement)) {
+      } else if (
+        e.key === "Escape" &&
+        !e.defaultPrevented &&
+        !(e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement)
+      ) {
         setCited(null);
       }
     };
@@ -259,6 +410,7 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
   const renderSet = useMemo(() => {
     const s = new Set<number>(visiblePages);
     for (let p = currentPage - RENDER_WINDOW; p <= currentPage + RENDER_WINDOW; p++) s.add(p);
+    renderSetRef.current = s;
     return s;
   }, [currentPage, visiblePages]);
 
@@ -304,6 +456,17 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
               title="Search (Ctrl+F)"
             >
               <SearchIcon width={16} height={16} />
+            </button>
+          )}
+          {passages.length > 0 && (
+            <button
+              type="button"
+              className={`${toolbarButton} ${showPassages ? "bg-amber-100 text-amber-800 hover:bg-amber-200 dark:bg-amber-900/50 dark:text-amber-200 dark:hover:bg-amber-900" : ""}`}
+              onClick={toggleShowPassages}
+              aria-pressed={showPassages}
+              title={showPassages ? "Hide highlights of answered passages" : "Show highlights of answered passages"}
+            >
+              <HighlighterIcon width={16} height={16} />
             </button>
           )}
           <button type="button" className={toolbarButton} onClick={zoomOut} disabled={zoomIndex <= 0} title="Zoom out">
@@ -373,7 +536,11 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
         </div>
       )}
 
-      <div ref={scrollRef} className="relative min-h-0 flex-1 overflow-auto bg-slate-200/70 dark:bg-slate-950">
+      <div
+        ref={scrollRef}
+        onClick={onViewerClick}
+        className="relative min-h-0 flex-1 overflow-auto bg-slate-200/70 dark:bg-slate-950"
+      >
         {loadError ? (
           <div className="p-8 text-center text-sm text-red-600">{loadError}</div>
         ) : (
@@ -427,4 +594,4 @@ export function PdfViewer({ fileUrl, ref, onPageChange, onAskAboutSelection }: P
       )}
     </div>
   );
-}
+});

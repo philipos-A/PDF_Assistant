@@ -44,6 +44,7 @@ const saved: StoredTurn[] = [
 
 function renderPanel() {
   const onCitationClick = vi.fn();
+  const onLiveCitation = vi.fn();
   render(
     <ChatPanel
       doc={doc}
@@ -52,10 +53,11 @@ function renderPanel() {
       selectionRequest={null}
       onPageClick={vi.fn()}
       onCitationClick={onCitationClick}
+      onLiveCitation={onLiveCitation}
       onCollapse={vi.fn()}
     />,
   );
-  return { onCitationClick };
+  return { onCitationClick, onLiveCitation };
 }
 
 describe("ChatPanel", () => {
@@ -80,7 +82,7 @@ describe("ChatPanel", () => {
       h.onDelta("[1](#cite-1).");
       h.onDone?.({ stop_reason: "end_turn", model: "m" });
     });
-    const { onCitationClick } = renderPanel();
+    const { onCitationClick, onLiveCitation } = renderPanel();
     await screen.findByText("Attention only.");
 
     await userEvent.type(screen.getByRole("textbox"), "Which function?{Enter}");
@@ -90,6 +92,8 @@ describe("ChatPanel", () => {
       expect.anything(),
       expect.anything(),
     );
+    // With Voice off, the cited passage is highlighted as soon as the Citation streams in.
+    expect(onLiveCitation).toHaveBeenCalledWith(expect.objectContaining({ n: 1, start_page: 4 }));
     await userEvent.click(await screen.findByRole("button", { name: "Source 1, p. 4" }));
     expect(onCitationClick).toHaveBeenCalledWith(expect.objectContaining({ n: 1, start_page: 4 }));
   });

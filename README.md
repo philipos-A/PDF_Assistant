@@ -25,11 +25,26 @@ you can click to jump to, and render math with KaTeX.
 - **Cited answers.** Claude's citations come back as numbered chips in the answer,
   with a **Sources** list underneath. Click one to scroll to the passage and
   highlight it in the PDF (press Escape to clear the highlight).
+- **Live highlights.** While an answer streams in, each passage it cites is
+  highlighted in the PDF as the citation arrives, with a highlighter that sweeps
+  across the text line by line. With **Voice** on, the highlight follows the voice
+  instead: each passage is swept as the sentence that relies on it is spoken.
+- **Answered passages stay marked.** Text you asked about (indigo) and passages
+  that answers cited (amber) stay underlined in the PDF. Click one to open a card
+  with every saved answer about it: listen to it, follow its citations, or jump to
+  it in the chat (**In chat**). The highlighter button in the viewer toolbar hides
+  or shows these marks.
 - **Clickable page references.** "p. 4", "pp. 5–6" and "page 12" in answers
   scroll the viewer to that page. Each answer also shows which page it was asked from.
 - **Push-to-talk voice input** (Web Speech API). Hold the mic and release to
   send, or tap once for hands-free and tap again to send. Shows a live transcript.
-- **Read-aloud answers** (`speechSynthesis`), switched on with the **Voice** toggle.
+- **Natural read-aloud voice.** Switch on **Voice** to have answers read aloud by
+  [Kokoro](https://huggingface.co/hexgrad/Kokoro-82M), an open text-to-speech model
+  that runs in your browser (via `kokoro-js`, on WebGPU where available), so it's
+  free and the answer text never leaves your machine. Reading starts at the first
+  finished sentence while the answer is still streaming; **Stop** in the chat header
+  stops it. Any answer can also be replayed with **Read aloud**. If Kokoro can't run,
+  the browser's built-in voice (`speechSynthesis`) is used instead.
 - **Saved conversations.** Questions and answers are stored per paper in SQLite,
   so they survive a reload or a restart. **Clear** in the chat header deletes them.
 - **Cheap follow-up questions.** Each PDF is uploaded to Claude's Files API once
@@ -208,9 +223,11 @@ frontend/
   src/App.tsx             layout, resizable/collapsible chat, doc restore
   src/components/         PdfViewer, ChatPanel, Message, Library, UploadView, …
                           (*.test.tsx: component tests)
-  src/hooks/              PDF search, speech recognition and synthesis, text selection
+  src/hooks/              PDF search, speech recognition, the read-aloud voice, text selection
   src/lib/                page and citation links, text matching for search and
-                          highlights, text-to-speech cleanup (*.test.ts)
+                          highlights, Marked Passages, text-to-speech cleanup (*.test.ts)
+  src/voice/              Kokoro voice in a Web Worker, and the player that speaks
+                          answers chunk by chunk and reports their citations
 .github/workflows/ci.yml  runs fmt, clippy, cargo test, Vitest and the frontend build
 ```
 
@@ -235,8 +252,14 @@ frontend/
   but **not Firefox**, where the mic is shown disabled with a tooltip. Chrome sends
   audio to Google's speech service, so it needs a network connection. Microphone
   access requires `localhost` or HTTPS.
-- **Read-aloud** uses the browser's built-in voices. Equations are announced as
+- **Read-aloud voice:** the first time you use it, the Kokoro model is downloaded
+  from Hugging Face (about 90 MB, or about 330 MB with WebGPU, which uses the
+  full-precision weights) and then cached by the browser. Speech is generated
+  sentence by sentence; without WebGPU (on WebAssembly) it can be slower than
+  real time, so there may be pauses. The voice is English only. Equations are announced as
   "equation shown on screen" rather than read symbol by symbol.
+- **Live highlights** highlight one passage at a time: when a spoken chunk relies on
+  several citations, the first one is shown.
 - **No official Rust SDK:** new API features have to be added by hand in
   `src/claude.rs`, rather than arriving with an SDK update.
 - **Password-protected PDFs** are rejected at upload, including ones that only

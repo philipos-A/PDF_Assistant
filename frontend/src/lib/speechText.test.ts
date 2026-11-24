@@ -1,11 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { chunkForSpeech, markdownToSpeech } from "./speechText";
+import { chunkForSpeech, markdownToSpeech, speechSegments } from "./speechText";
 
 describe("markdownToSpeech", () => {
   it("strips emphasis and expands page abbreviations", () => {
-    expect(markdownToSpeech("**Bold** claim, see p. 4 and pp. 5–6")).toBe(
-      "Bold claim, see page 4 and pages 5–6",
-    );
+    expect(markdownToSpeech("**Bold** claim, see p. 4 and pp. 5–6")).toBe("Bold claim, see page 4 and pages 5–6");
   });
 
   it("drops citation markers", () => {
@@ -21,10 +19,12 @@ describe("markdownToSpeech", () => {
     expect(markdownToSpeech("$\\alpha_i$")).toBe("alpha i");
   });
 
+  it("does not double a full stop at a paragraph break", () => {
+    expect(markdownToSpeech("**Term.** One.\n\nNext")).toBe("Term. One. Next");
+  });
+
   it("keeps link text and turns paragraphs into sentences", () => {
-    expect(markdownToSpeech("# Title\n\nSee [the paper](https://example.com)")).toBe(
-      "Title. See the paper",
-    );
+    expect(markdownToSpeech("# Title\n\nSee [the paper](https://example.com)")).toBe("Title. See the paper");
   });
 });
 
@@ -35,5 +35,22 @@ describe("chunkForSpeech", () => {
 
   it("returns nothing for empty text", () => {
     expect(chunkForSpeech("")).toEqual([]);
+  });
+});
+
+describe("speechSegments", () => {
+  it("tags each chunk with the citations in it", () => {
+    expect(speechSegments("[1](#cite-1)Attention is all you need. [2](#cite-2)[3](#cite-3)It is fast.", 30)).toEqual([
+      { text: "Attention is all you need.", cites: [1] },
+      { text: "It is fast.", cites: [2, 3] },
+    ]);
+  });
+
+  it("keeps a chunk without citations", () => {
+    expect(speechSegments("Plain answer.")).toEqual([{ text: "Plain answer.", cites: [] }]);
+  });
+
+  it("returns nothing for an empty answer", () => {
+    expect(speechSegments("[1](#cite-1)")).toEqual([]);
   });
 });

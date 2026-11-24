@@ -7,6 +7,7 @@ import { citationPages, parseCiteHref } from "../lib/citations";
 import { linkifyPageRefs, parsePageHref } from "../lib/pageRefs";
 import type { ChatMessage, Citation } from "../types";
 import { SpeakerIcon } from "./icons";
+import { SpeakingBars } from "./SpeakingBars";
 
 interface Props {
   message: ChatMessage;
@@ -14,7 +15,11 @@ interface Props {
   onPageClick: (page: number) => void;
   /** Show a cited passage in the PDF. */
   onCitationClick: (citation: Citation) => void;
-  onSpeak?: (text: string) => void;
+  onSpeak?: (message: ChatMessage) => void;
+  /** This Answer is being read aloud. */
+  reading?: boolean;
+  /** Smaller layout for the saved-Answers card in the viewer. */
+  compact?: boolean;
 }
 
 function CitationChip({ citation, onClick }: { citation: Citation; onClick: (c: Citation) => void }) {
@@ -68,7 +73,15 @@ function PageBadge({ page, onClick }: { page: number; onClick: (p: number) => vo
   );
 }
 
-export const Message = memo(function Message({ message, pageCount, onPageClick, onCitationClick, onSpeak }: Props) {
+export const Message = memo(function Message({
+  message,
+  pageCount,
+  onPageClick,
+  onCitationClick,
+  onSpeak,
+  reading = false,
+  compact = false,
+}: Props) {
   const citations = message.citations;
   const components = useMemo<Components>(
     () => ({
@@ -103,7 +116,10 @@ export const Message = memo(function Message({ message, pageCount, onPageClick, 
 
   if (message.role === "user") {
     return (
-      <div className="flex flex-col items-end gap-1.5">
+      <div
+        id={compact ? undefined : `message-${message.id}`}
+        className="message-enter flex scroll-mt-4 flex-col items-end gap-1.5"
+      >
         {message.context?.selected_text && (
           <blockquote className="max-w-[90%] border-l-2 border-indigo-400 pl-2 text-xs italic text-slate-500 line-clamp-3 dark:text-slate-400">
             “{message.context.selected_text}”
@@ -121,8 +137,15 @@ export const Message = memo(function Message({ message, pageCount, onPageClick, 
   const markdown = linkifyPageRefs(message.content, pageCount);
 
   return (
-    <div className="group flex flex-col items-start gap-1.5">
-      <div className="w-full rounded-2xl rounded-bl-md bg-white px-4 py-3 shadow-sm ring-1 ring-slate-200 dark:bg-slate-900 dark:ring-slate-800">
+    <div
+      id={compact ? undefined : `message-${message.id}`}
+      className="message-enter group flex scroll-mt-4 flex-col items-start gap-1.5"
+    >
+      <div
+        className={`w-full rounded-2xl rounded-bl-md bg-white shadow-sm ring-1 transition-[box-shadow,ring-color] duration-300 dark:bg-slate-900 ${
+          compact ? "px-3 py-2.5" : "px-4 py-3"
+        } ${reading ? "ring-2 ring-indigo-400/70 shadow-indigo-200/60 dark:ring-indigo-500/60" : "ring-slate-200 dark:ring-slate-800"}`}
+      >
         {waiting && !message.content ? (
           <div className="flex items-center gap-2 text-sm text-slate-500">
             <span className="flex gap-1">
@@ -138,7 +161,11 @@ export const Message = memo(function Message({ message, pageCount, onPageClick, 
           </div>
         ) : (
           <div className="prose prose-sm prose-slate max-w-none dark:prose-invert prose-pre:bg-slate-900 prose-pre:text-slate-100 prose-code:before:content-none prose-code:after:content-none">
-            <ReactMarkdown remarkPlugins={[remarkGfm, remarkMath]} rehypePlugins={[rehypeKatex]} components={components}>
+            <ReactMarkdown
+              remarkPlugins={[remarkGfm, remarkMath]}
+              rehypePlugins={[rehypeKatex]}
+              components={components}
+            >
               {markdown}
             </ReactMarkdown>
             {message.status === "streaming" && (
@@ -158,15 +185,25 @@ export const Message = memo(function Message({ message, pageCount, onPageClick, 
       <div className="flex items-center gap-2 pl-1 text-[11px] text-slate-500">
         <PageBadge page={message.page} onClick={onPageClick} />
         {message.usedFallback && <span title="Answered by a fallback model">fallback model</span>}
-        {onSpeak && message.status === "done" && message.content && (
-          <button
-            type="button"
-            onClick={() => onSpeak(message.content)}
-            className="flex items-center gap-1 opacity-0 transition hover:text-indigo-600 group-hover:opacity-100 focus:opacity-100"
-            title="Read this answer aloud"
-          >
-            <SpeakerIcon width={13} height={13} /> Read aloud
-          </button>
+        {reading ? (
+          <span className="animate-fade-in flex items-center gap-1.5 font-medium text-indigo-600 dark:text-indigo-400">
+            <SpeakingBars /> Reading aloud
+          </span>
+        ) : (
+          onSpeak &&
+          message.status === "done" &&
+          message.content && (
+            <button
+              type="button"
+              onClick={() => onSpeak(message)}
+              className={`flex items-center gap-1 rounded px-1 py-0.5 transition hover:text-indigo-600 focus:opacity-100 ${
+                compact ? "" : "opacity-0 group-hover:opacity-100"
+              }`}
+              title="Read this answer aloud"
+            >
+              <SpeakerIcon width={13} height={13} /> Read aloud
+            </button>
+          )
         )}
       </div>
     </div>

@@ -67,5 +67,9 @@ _Avoid_: page link
 A passage of the Document that the API reports an Answer relies on, with the Pages it is on. Numbered within its Answer and shown as a chip; following one highlights the passage.
 _Avoid_: Source, quote, reference
 
+**Marked Passage**:
+A passage of the Document that a Selection or a Citation in the Conversation points to. It stays marked in the viewer, and clicking it shows the Answers about it.
+_Avoid_: Annotation, note, saved highlight
+
 **Fallback**:
 An Answer produced by the backup model because the configured model was unavailable.

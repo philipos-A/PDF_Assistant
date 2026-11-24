@@ -1,10 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { documentFileUrl, getDocument, getHealth } from "./api";
 import { ChatPanel, type SelectionRequest } from "./components/ChatPanel";
 import { ChatIcon, FileIcon } from "./components/icons";
+import { PassageCard } from "./components/PassageCard";
 import { PdfViewer, type PdfViewerHandle } from "./components/PdfViewer";
 import { UploadView } from "./components/UploadView";
-import type { Citation, DocInfo, Health } from "./types";
+import { useVoice } from "./hooks/useVoice";
+import { buildPassages } from "./lib/passages";
+import type { ChatMessage, Citation, DocInfo, Health } from "./types";
 
 const DOC_KEY = "pdf-assistant:doc";
 const WIDTH_KEY = "pdf-assistant:chat-width";
@@ -36,7 +39,17 @@ export default function App() {
   const [selectionRequest, setSelectionRequest] = useState<SelectionRequest | null>(null);
   const [chatOpen, setChatOpen] = useState(true);
   const [chatWidth, setChatWidth] = useState(() => Number(load(WIDTH_KEY)) || 420);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
+  const [openPassage, setOpenPassage] = useState<{ key: string; anchor: DOMRect } | null>(null);
   const viewerRef = useRef<PdfViewerHandle>(null);
+  const { voice, readingId } = useVoice();
+
+  const passages = useMemo(() => buildPassages(messages), [messages]);
+  // The viewer only needs a new list when passages are added or change kind, not on every
+  // streamed word; redrawing its highlights is the expensive part.
+  const passageSig = passages.map((p) => `${p.key}|${p.kind}`).join("\n");
+  const viewerPassages = useMemo(() => passages, [passageSig]);
+  const shownPassage = openPassage && passages.find((p) => p.key === openPassage.key);
 
   useEffect(() => {
     getHealth()
@@ -61,6 +74,9 @@ export default function App() {
     setCurrentPage(1);
     setVisiblePages([1]);
     setSelectionRequest(null);
+    setMessages([]);
+    setOpenPassage(null);
+    voice.cancel();
   };
 
   const onPageChange = useCallback((current: number, visible: number[]) => {
@@ -70,6 +86,36 @@ export default function App() {
 
   const goToPage = useCallback((page: number) => viewerRef.current?.scrollToPage(page), []);
   const showCitation = useCallback((c: Citation) => viewerRef.current?.showCitation(c), []);
+  const onPassageClick = useCallback((key: string, anchor: DOMRect) => setOpenPassage({ key, anchor }), []);
+  const closePassage = useCallback(() => setOpenPassage(null), []);
+
+  const speakMessage = useCallback(
+    (m: ChatMessage) =>
+      voice.speak(m.id, m.content, (segment) => {
+        const c = m.citations?.find((x) => x.n === segment.cites[0]);
+        if (c) showCitation(c);
+      }),
+    [voice, showCitation],
+  );
+
+  /** Open the chat and bring an Answer into view with a brief flash. */
+  const showInChat = useCallback((answerId: string) => {
+    setOpenPassage(null);
+    setChatOpen(true);
+    // If the chat was closed it reloads the Conversation first, so wait for the Answer to appear.
+    const started = performance.now();
+    requestAnimationFrame(function find() {
+      const el = document.getElementById(`message-${answerId}`);
+      if (!el) {
+        if (performance.now() - started < 2000) requestAnimationFrame(find);
+        return;
+      }
+      el.scrollIntoView({ behavior: "smooth", block: "start" });
+      el.classList.remove("message-flash");
+      void el.offsetWidth; // restart the animation
+      el.classList.add("message-flash");
+    });
+  }, []);
 
   const onAskAboutSelection = useCallback((text: string, page: number | null) => {
     setChatOpen(true);
@@ -102,8 +148,8 @@ export default function App() {
     </div>
   ) : health && !health.api_key_configured ? (
     <div className="bg-amber-500 px-4 py-2 text-center text-sm text-amber-950">
-      ANTHROPIC_API_KEY is not set. Add it to <code className="font-mono">backend/.env</code> and restart the
-      backend to ask questions.
+      ANTHROPIC_API_KEY is not set. Add it to <code className="font-mono">backend/.env</code> and restart the backend to
+      ask questions.
     </div>
   ) : null;
 
@@ -159,6 +205,8 @@ export default function App() {
             fileUrl={documentFileUrl(doc.doc_id)}
             onPageChange={onPageChange}
             onAskAboutSelection={onAskAboutSelection}
+            passages={viewerPassages}
+            onPassageClick={onPassageClick}
           />
         </section>
         {chatOpen && (
@@ -182,12 +230,28 @@ export default function App() {
                 selectionRequest={selectionRequest}
                 onPageClick={goToPage}
                 onCitationClick={showCitation}
+                onLiveCitation={showCitation}
+                onMessagesChange={setMessages}
                 onCollapse={() => setChatOpen(false)}
               />
             </aside>
           </>
         )}
       </main>
+      {shownPassage && openPassage && (
+        <PassageCard
+          key={shownPassage.key}
+          passage={shownPassage}
+          anchor={openPassage.anchor}
+          pageCount={doc.page_count}
+          readingId={readingId}
+          onClose={closePassage}
+          onPageClick={goToPage}
+          onCitationClick={showCitation}
+          onSpeak={voice.supported ? speakMessage : undefined}
+          onShowInChat={showInChat}
+        />
+      )}
     </div>
   );
 }
