@@ -2,6 +2,7 @@
 
 pub mod claude;
 pub mod config;
+pub mod openrouter;
 pub mod prompts;
 pub mod routes;
 pub mod storage;

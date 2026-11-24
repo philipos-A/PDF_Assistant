@@ -60,6 +60,11 @@ function CitationList({ citations, onClick }: { citations: Citation[]; onClick: 
   );
 }
 
+/** "google/gemini-4-hydrogen" → "gemini-4-hydrogen". */
+function modelName(model: string): string {
+  return model.slice(model.lastIndexOf("/") + 1);
+}
+
 function PageBadge({ page, onClick }: { page: number; onClick: (p: number) => void }) {
   return (
     <button
@@ -184,7 +189,11 @@ export const Message = memo(function Message({
       </div>
       <div className="flex items-center gap-2 pl-1 text-[11px] text-slate-500">
         <PageBadge page={message.page} onClick={onPageClick} />
-        {message.usedFallback && <span title="Answered by a fallback model">fallback model</span>}
+        {message.usedFallback && (
+          <span title={`Claude couldn't answer, so ${message.model ?? "a fallback model"} did`}>
+            {message.model ? `answered by ${modelName(message.model)}` : "fallback model"}
+          </span>
+        )}
         {reading ? (
           <span className="animate-fade-in flex items-center gap-1.5 font-medium text-indigo-600 dark:text-indigo-400">
             <SpeakingBars /> Reading aloud

@@ -146,10 +146,15 @@ export default function App() {
     <div className="bg-red-600 px-4 py-2 text-center text-sm text-white">
       Can't reach the backend on port 8000. Start it with <code className="font-mono">make dev</code>.
     </div>
-  ) : health && !health.api_key_configured ? (
+  ) : health && !health.api_key_configured && !health.fallback_configured ? (
     <div className="bg-amber-500 px-4 py-2 text-center text-sm text-amber-950">
       ANTHROPIC_API_KEY is not set. Add it to <code className="font-mono">backend/.env</code> and restart the backend to
       ask questions.
+    </div>
+  ) : health && !health.api_key_configured ? (
+    <div className="bg-sky-100 px-4 py-2 text-center text-sm text-sky-950 dark:bg-sky-950 dark:text-sky-100">
+      ANTHROPIC_API_KEY is not set, so answers come from the OpenRouter models. Add it to{" "}
+      <code className="font-mono">backend/.env</code> to use Claude.
     </div>
   ) : null;
 

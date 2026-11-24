@@ -7,6 +7,11 @@ use std::path::PathBuf;
 pub struct Settings {
     pub anthropic_api_key: String,
     pub anthropic_base_url: String,
+    /// OpenRouter key for the fallback models; empty means no fallback.
+    pub openrouter_api_key: String,
+    pub openrouter_base_url: String,
+    /// Models tried in order through OpenRouter when Claude is unavailable.
+    pub openrouter_models: Vec<String>,
     pub claude_model: String,
     pub claude_effort: String,
     pub max_output_tokens: u32,
@@ -26,6 +31,13 @@ impl Default for Settings {
         Self {
             anthropic_api_key: String::new(),
             anthropic_base_url: "https://api.anthropic.com".into(),
+            openrouter_api_key: String::new(),
+            openrouter_base_url: "https://openrouter.ai/api/v1".into(),
+            openrouter_models: vec![
+                "google/gemini-4-hydrogen".into(),
+                "openai/gpt-6.2-sol".into(),
+                "google/gemini-3.8-flash".into(),
+            ],
             claude_model: "claude-sonnet-5-5".into(),
             claude_effort: "medium".into(),
             max_output_tokens: 16_000,
@@ -77,8 +89,13 @@ fn parse_bool(name: &str, default: bool) -> Result<bool, String> {
 
 impl Settings {
     /// Load `backend/.env` (if present) and read settings from the environment.
+    ///
+    /// Values in `backend/.env` win over the shell's. A shell set up for Claude Code
+    /// through OpenRouter exports `ANTHROPIC_API_KEY=""`, which would otherwise hide
+    /// the key in `.env`. For the same reason the API address is read from
+    /// `CLAUDE_API_BASE_URL`, not from the shell's `ANTHROPIC_BASE_URL`.
     pub fn from_env() -> Result<Self, String> {
-        let _ = dotenvy::from_path(backend_dir().join(".env"));
+        let _ = dotenvy::from_path_override(backend_dir().join(".env"));
         let d = Settings::default();
 
         let storage_dir = match var("STORAGE_DIR") {
@@ -103,7 +120,17 @@ impl Settings {
 
         Ok(Self {
             anthropic_api_key: var("ANTHROPIC_API_KEY").unwrap_or_default(),
-            anthropic_base_url: var("ANTHROPIC_BASE_URL").unwrap_or(d.anthropic_base_url),
+            anthropic_base_url: var("CLAUDE_API_BASE_URL").unwrap_or(d.anthropic_base_url),
+            openrouter_api_key: var("OPENROUTER_API_KEY").unwrap_or_default(),
+            openrouter_base_url: var("OPENROUTER_BASE_URL").unwrap_or(d.openrouter_base_url),
+            openrouter_models: match var("OPENROUTER_MODELS") {
+                None => d.openrouter_models,
+                Some(v) => v
+                    .split(',')
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect(),
+            },
             claude_model: var("CLAUDE_MODEL").unwrap_or(d.claude_model),
             claude_effort: var("CLAUDE_EFFORT").unwrap_or(d.claude_effort),
             max_output_tokens: parse("MAX_OUTPUT_TOKENS", d.max_output_tokens)?,
@@ -123,6 +150,14 @@ impl Settings {
         !self.anthropic_api_key.trim().is_empty()
     }
 
+    /// An OpenRouter key and at least one model are set (the `INSERT KEY` placeholder doesn't count).
+    pub fn fallback_configured(&self) -> bool {
+        let key = self.openrouter_api_key.trim();
+        !key.is_empty()
+            && !key.eq_ignore_ascii_case("INSERT KEY")
+            && !self.openrouter_models.is_empty()
+    }
+
     pub fn max_upload_bytes(&self) -> usize {
         usize::try_from(self.max_upload_mb.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
     }
@@ -139,5 +174,16 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(s.max_upload_bytes(), usize::MAX);
+    }
+
+    #[test]
+    fn placeholder_openrouter_key_is_not_a_fallback() {
+        let with = |key: &str| Settings {
+            openrouter_api_key: key.into(),
+            ..Settings::default()
+        };
+        assert!(!with("").fallback_configured());
+        assert!(!with("INSERT KEY").fallback_configured());
+        assert!(with("sk-or-v1-abc").fallback_configured());
     }
 }

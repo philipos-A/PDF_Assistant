@@ -164,8 +164,8 @@ export function ChatPanel({
             update(assistantId, { content: answer, status: "streaming" });
             if (readAloud) read().update(answer);
           },
-          onDone: () => {
-            update(assistantId, { status: "done" });
+          onDone: ({ model }) => {
+            update(assistantId, { status: "done", model });
             if (readAloud && answer) read().finish(answer);
           },
           // On a refusal, drop the partial answer that streamed before it.

@@ -26,6 +26,11 @@ function renderMessage(message: ChatMessage) {
 }
 
 describe("Message", () => {
+  it("names the model that answered when Claude was unavailable", () => {
+    renderMessage(answer({ usedFallback: true, model: "google/gemini-4-hydrogen" }));
+    expect(screen.getByText("answered by gemini-4-hydrogen")).toBeInTheDocument();
+  });
+
   it("turns citation markers into chips that show the passage", async () => {
     const { onCitationClick } = renderMessage(answer());
     await userEvent.click(screen.getByRole("button", { name: "Source 1, p. 3" }));

@@ -15,7 +15,8 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 
 use crate::AppState;
-use crate::claude::{self, Citation, DocumentSource, Role, Turn};
+use crate::claude::{self, Citation, DocumentSource, OutEvent, Role, Turn};
+use crate::openrouter;
 use crate::prompts::ReaderContext;
 use crate::storage::{DocumentMeta, StoreError, StoredTurn};
 
@@ -61,6 +62,7 @@ pub async fn health(State(state): State<AppState>) -> Json<Value> {
         "status": "ok",
         "model": s.claude_model,
         "api_key_configured": s.api_key_configured(),
+        "fallback_configured": s.fallback_configured(),
         "max_upload_mb": s.max_upload_mb,
         "max_pages": s.max_pages,
     }))
@@ -342,6 +344,27 @@ impl AnswerSoFar {
         }
     }
 
+    /// On a `done` event with an Answer, save the Question and Answer, and start afresh.
+    async fn save_if_done(
+        &mut self,
+        event: &OutEvent,
+        store: &crate::storage::DocumentStore,
+        doc_id: &str,
+        question: &StoredTurn,
+    ) {
+        if event.event != "done" || self.text.trim().is_empty() {
+            return;
+        }
+        let model = event.data["model"].as_str().map(str::to_string);
+        let answer = std::mem::take(self).into_turn(model);
+        if let Err(e) = store
+            .append_exchange(doc_id, question.clone(), answer)
+            .await
+        {
+            tracing::error!(?e, "could not save the conversation");
+        }
+    }
+
     fn into_turn(self, model: Option<String>) -> StoredTurn {
         StoredTurn {
             role: Role::Assistant,
@@ -360,7 +383,7 @@ pub async fn chat(
     body: Result<Json<ChatRequest>, JsonRejection>,
 ) -> ApiResult<Sse<impl Stream<Item = Result<Event, Infallible>>>> {
     let settings = state.settings.clone();
-    if !settings.api_key_configured() {
+    if !settings.api_key_configured() && !settings.fallback_configured() {
         return Err(ApiError::new(
             StatusCode::SERVICE_UNAVAILABLE,
             "ANTHROPIC_API_KEY is not set. Copy backend/.env.example to backend/.env, add your key, and restart the backend.",
@@ -397,61 +420,90 @@ pub async fn chat(
     let events = async_stream::stream! {
         let store = &state.store;
         let doc_id = meta.doc_id.as_str();
-        let mut file_id = meta.file_id.clone();
-        let mut reuploaded = false;
-        'request: loop {
-            if settings.use_files_api && file_id.is_none() {
-                match claude::upload_file(&state.http, &settings, pdf.clone(), &meta.filename).await {
-                    Ok(id) => {
-                        if let Err(e) = store.set_file_id(doc_id, Some(&id)).await {
-                            tracing::warn!(?e, "could not save the Files API id");
-                        }
-                        file_id = Some(id);
-                    }
-                    // Still answer: send the PDF inline this time.
-                    Err(e) => tracing::warn!(error = %e, "Files API upload failed; sending the PDF inline"),
-                }
-            }
-            let source = match &file_id {
-                Some(id) => DocumentSource::File(id),
-                None => DocumentSource::Base64(&pdf),
-            };
-            let messages = claude::build_messages(
-                claude::document_block(&source, settings.enable_citations),
-                history.clone(),
-                question.clone(),
-                Some(meta.page_count),
-            );
+        let mut so_far = AnswerSoFar::default();
+        // Why Claude couldn't answer, when the fallback models answer instead.
+        let mut claude_down: Option<String> = None;
 
-            let answer = claude::stream_answer(state.http.clone(), (*settings).clone(), messages);
-            futures_util::pin_mut!(answer);
-            let mut so_far = AnswerSoFar::default();
-            while let Some(event) = answer.next().await {
-                if event.event == "file_missing" {
-                    let _ = store.set_file_id(doc_id, None).await;
-                    file_id = None;
-                    if !reuploaded {
-                        reuploaded = true;
-                        tracing::info!(doc_id, "uploaded PDF is gone; uploading it again");
-                        continue 'request;
+        if settings.api_key_configured() {
+            let mut file_id = meta.file_id.clone();
+            let mut reuploaded = false;
+            'request: loop {
+                if settings.use_files_api && file_id.is_none() {
+                    match claude::upload_file(&state.http, &settings, pdf.clone(), &meta.filename).await {
+                        Ok(id) => {
+                            if let Err(e) = store.set_file_id(doc_id, Some(&id)).await {
+                                tracing::warn!(?e, "could not save the Files API id");
+                            }
+                            file_id = Some(id);
+                        }
+                        // Still answer: send the PDF inline this time.
+                        Err(e) => tracing::warn!(error = %e, "Files API upload failed; sending the PDF inline"),
                     }
-                    yield claude::OutEvent::new("error", json!({"message": "Claude could not find the uploaded PDF. Try again."}));
-                    break 'request;
                 }
-                so_far.record(&event);
-                if event.event == "done" && !so_far.text.trim().is_empty() {
-                    let model = event.data["model"].as_str().map(str::to_string);
-                    if let Err(e) = store
-                        .append_exchange(doc_id, saved_question.clone(), so_far.into_turn(model))
-                        .await
-                    {
-                        tracing::error!(?e, "could not save the conversation");
+                let source = match &file_id {
+                    Some(id) => DocumentSource::File(id),
+                    None => DocumentSource::Base64(&pdf),
+                };
+                let messages = claude::build_messages(
+                    claude::document_block(&source, settings.enable_citations),
+                    history.clone(),
+                    question.clone(),
+                    Some(meta.page_count),
+                );
+
+                let answer = claude::stream_answer(state.http.clone(), (*settings).clone(), messages);
+                futures_util::pin_mut!(answer);
+                while let Some(event) = answer.next().await {
+                    if event.event == "file_missing" {
+                        let _ = store.set_file_id(doc_id, None).await;
+                        file_id = None;
+                        if !reuploaded {
+                            reuploaded = true;
+                            tracing::info!(doc_id, "uploaded PDF is gone; uploading it again");
+                            continue 'request;
+                        }
+                        yield OutEvent::new("error", json!({"message": "Claude could not find the uploaded PDF. Try again."}));
+                        return;
                     }
-                    so_far = AnswerSoFar::default();
+                    // Claude can't serve right now and nothing has been sent yet: switch over.
+                    if event.is_unavailable() && settings.fallback_configured() && so_far.text.is_empty() {
+                        let message = event.data["message"].as_str().unwrap_or("Claude is unavailable.");
+                        tracing::warn!(reason = message, "Claude unavailable; answering with the fallback models");
+                        claude_down = Some(message.to_string());
+                        break 'request;
+                    }
+                    so_far.record(&event);
+                    so_far.save_if_done(&event, store, doc_id, &saved_question).await;
+                    yield event;
                 }
-                yield event;
+                return;
             }
-            break;
+        }
+
+        // No Claude key, or Claude is unavailable: answer through OpenRouter.
+        let fallback = OutEvent::new("status", json!({"state": "fallback"}));
+        so_far.record(&fallback);
+        yield fallback;
+        let body = openrouter::request_body(
+            &settings,
+            &pdf,
+            &meta.filename,
+            history,
+            question,
+            Some(meta.page_count),
+        );
+        let answer = openrouter::stream_answer(state.http.clone(), (*settings).clone(), body);
+        futures_util::pin_mut!(answer);
+        while let Some(mut event) = answer.next().await {
+            if event.event == "error"
+                && let Some(reason) = &claude_down
+            {
+                let message = event.data["message"].as_str().unwrap_or_default().to_string();
+                event.data["message"] = json!(format!("{reason} The fallback models couldn't answer either: {message}"));
+            }
+            so_far.record(&event);
+            so_far.save_if_done(&event, store, doc_id, &saved_question).await;
+            yield event;
         }
     }
     .map(|e| Ok(Event::default().event(e.event).data(e.data.to_string())));

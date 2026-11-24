@@ -72,4 +72,4 @@ A passage of the Document that a Selection or a Citation in the Conversation poi
 _Avoid_: Annotation, note, saved highlight
 
 **Fallback**:
-An Answer produced by the backup model because the configured model was unavailable.
+An Answer produced by another model because the configured Claude model couldn't give it: a backup Claude model when Claude declines, or a model reached through OpenRouter (such as Gemini or GPT) when Claude's usage has run out or it is unavailable.

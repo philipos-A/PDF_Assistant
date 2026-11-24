@@ -1073,3 +1073,236 @@ async fn chat_without_api_key_is_503() {
         false
     );
 }
+
+// ---------------------------------------------------------------------------
+// OpenRouter fallback
+
+/// A canned OpenRouter stream: a keep-alive comment, text with a citation tag split
+/// across chunks, a finish reason and usage, then `[DONE]`.
+fn openrouter_ok_stream() -> String {
+    let chunk = |delta: Value, finish: Value| {
+        format!(
+            "data: {}\n\n",
+            json!({"model": "google/gemini-test", "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+        )
+    };
+    [
+        ": OPENROUTER PROCESSING\n\n".to_string(),
+        chunk(json!({"content": "{{cite p=1: Page "}), Value::Null),
+        chunk(json!({"content": "1}}Gemini says hi "}), Value::Null),
+        chunk(json!({"content": "(p. 1)."}), json!("stop")),
+        format!(
+            "data: {}\n\n",
+            json!({"model": "google/gemini-test", "choices": [], "usage": {"prompt_tokens": 50, "completion_tokens": 9}})
+        ),
+        "data: [DONE]\n\n".to_string(),
+    ]
+    .concat()
+}
+
+/// Start a mock OpenRouter API; returns its base URL and every request body.
+async fn mock_openrouter(
+    respond: impl Fn(usize) -> (StatusCode, &'static str, String) + Send + Sync + 'static,
+) -> (String, Arc<Mutex<Vec<(HeaderMap, Value)>>>) {
+    let rec: Arc<Mutex<Vec<(HeaderMap, Value)>>> = Arc::default();
+    let rec2 = rec.clone();
+    let respond = Arc::new(respond);
+    let router = Router::new().route(
+        "/api/v1/chat/completions",
+        post(move |headers: HeaderMap, body: String| {
+            let rec = rec2.clone();
+            let respond = respond.clone();
+            async move {
+                let n = {
+                    let mut r = rec.lock().unwrap();
+                    r.push((headers, serde_json::from_str(&body).unwrap()));
+                    r.len()
+                };
+                let (status, ctype, body) = respond(n);
+                (status, [("content-type", ctype)], body).into_response()
+            }
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/api/v1", listener.local_addr().unwrap());
+    tokio::spawn(async move { axum::serve(listener, router).await.unwrap() });
+    (url, rec)
+}
+
+fn test_app_with_fallback(
+    claude_url: &str,
+    claude_key: &str,
+    openrouter_url: &str,
+) -> (Router, tempdir::Dir) {
+    let dir = tempdir::Dir::new();
+    let settings = Settings {
+        anthropic_api_key: claude_key.into(),
+        anthropic_base_url: claude_url.into(),
+        openrouter_api_key: "sk-or-test".into(),
+        openrouter_base_url: openrouter_url.into(),
+        openrouter_models: vec!["google/gemini-test".into(), "openai/gpt-test".into()],
+        storage_dir: dir.path.clone(),
+        max_upload_mb: 1,
+        ..Settings::default()
+    };
+    (app(AppState::new(settings).unwrap()), dir)
+}
+
+fn rate_limited() -> MockReply {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        "application/json",
+        r#"{"type":"error","error":{"type":"rate_limit_error","message":"usage limit reached"}}"#
+            .into(),
+        vec![("retry-after", "3600")],
+    )
+}
+
+#[tokio::test]
+async fn rate_limited_claude_falls_back_to_openrouter() {
+    let (claude, claude_rec) = mock_claude_with_headers(|_| rate_limited()).await;
+    let (router, router_rec) =
+        mock_openrouter(|_| (StatusCode::OK, "text/event-stream", openrouter_ok_stream())).await;
+    let (app, _dir) = test_app_with_fallback(&claude, "test-key", &router);
+    let doc_id = upload(&app, 2).await;
+
+    let events = ask(&app, &doc_id).await;
+    let names: Vec<&str> = events.iter().map(|(e, _)| e.as_str()).collect();
+    assert!(!names.contains(&"error"), "{events:?}");
+    assert_eq!(events[0], ("status".into(), json!({"state": "fallback"})));
+    let citation = events.iter().find(|(e, _)| e == "citation").unwrap();
+    assert_eq!(
+        citation.1,
+        json!({"n": 1, "cited_text": "Page 1", "start_page": 1, "end_page": 1})
+    );
+    let text: String = events
+        .iter()
+        .filter(|(e, _)| e == "delta")
+        .map(|(_, d)| d["text"].as_str().unwrap())
+        .collect();
+    assert_eq!(text, "[1](#cite-1)Gemini says hi (p. 1).");
+    let done = &events.last().unwrap().1;
+    assert_eq!(done["model"], "google/gemini-test");
+    assert_eq!(done["usage"]["output_tokens"], 9);
+
+    // One Claude attempt (the hour-long retry-after fails fast), one OpenRouter request.
+    assert_eq!(claude_rec.lock().unwrap().calls, 1);
+    let requests = router_rec.lock().unwrap().clone();
+    assert_eq!(requests.len(), 1);
+    let (headers, body) = &requests[0];
+    assert_eq!(headers["authorization"], "Bearer sk-or-test");
+    assert_eq!(
+        body["models"],
+        json!(["google/gemini-test", "openai/gpt-test"])
+    );
+    assert_eq!(body["stream"], true);
+    assert_eq!(body["messages"][0]["role"], "system");
+    assert_eq!(body["messages"][1]["content"][0]["type"], "file");
+    assert!(
+        body["messages"][1]["content"][1]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Current page: 1 of 2")
+    );
+
+    // Saved like any Answer, marked as a fallback with the model that wrote it.
+    let (_, conv) = get_json(&app, &format!("/api/documents/{doc_id}/conversation")).await;
+    let answer = &conv["turns"][1];
+    assert_eq!(answer["model"], "google/gemini-test");
+    assert_eq!(answer["used_fallback"], true);
+    assert_eq!(answer["citations"][0]["cited_text"], "Page 1");
+}
+
+#[tokio::test]
+async fn out_of_credit_claude_falls_back_to_openrouter() {
+    let (claude, _) = mock_claude(|_| {
+        (StatusCode::BAD_REQUEST, "application/json", r#"{"type":"error","error":{"type":"invalid_request_error","message":"Your credit balance is too low to access the Anthropic API."}}"#.into())
+    })
+    .await;
+    let (router, router_rec) =
+        mock_openrouter(|_| (StatusCode::OK, "text/event-stream", openrouter_ok_stream())).await;
+    let (app, _dir) = test_app_with_fallback(&claude, "test-key", &router);
+    let doc_id = upload(&app, 1).await;
+    let events = ask(&app, &doc_id).await;
+    assert_eq!(events.last().unwrap().0, "done");
+    assert_eq!(router_rec.lock().unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn without_a_claude_key_openrouter_answers_directly() {
+    let (claude, claude_rec) = mock_claude(|_| unreachable!("Claude has no key")).await;
+    let (router, _) =
+        mock_openrouter(|_| (StatusCode::OK, "text/event-stream", openrouter_ok_stream())).await;
+    let (app, _dir) = test_app_with_fallback(&claude, "", &router);
+    let doc_id = upload(&app, 1).await;
+    let events = ask(&app, &doc_id).await;
+    assert_eq!(events.last().unwrap().0, "done");
+    let calls = {
+        let rec = claude_rec.lock().unwrap();
+        (rec.calls, rec.uploads)
+    };
+    assert_eq!(calls, (0, 0));
+
+    let (_, health) = get_json(&app, "/api/health").await;
+    assert_eq!(health["api_key_configured"], false);
+    assert_eq!(health["fallback_configured"], true);
+}
+
+#[tokio::test]
+async fn other_claude_errors_do_not_fall_back() {
+    let (claude, _) = mock_claude(|_| {
+        (StatusCode::UNAUTHORIZED, "application/json", r#"{"type":"error","error":{"type":"authentication_error","message":"invalid x-api-key"}}"#.into())
+    })
+    .await;
+    let (router, router_rec) =
+        mock_openrouter(|_| (StatusCode::OK, "text/event-stream", openrouter_ok_stream())).await;
+    let (app, _dir) = test_app_with_fallback(&claude, "bad-key", &router);
+    let doc_id = upload(&app, 1).await;
+    let events = ask(&app, &doc_id).await;
+    assert_eq!(events.last().unwrap().0, "error");
+    assert!(router_rec.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn both_unavailable_reports_both_reasons() {
+    let (claude, _) = mock_claude_with_headers(|_| rate_limited()).await;
+    let (router, router_rec) = mock_openrouter(|_| {
+        (
+            StatusCode::PAYMENT_REQUIRED,
+            "application/json",
+            r#"{"error":{"code":402,"message":"Insufficient credits"}}"#.into(),
+        )
+    })
+    .await;
+    let (app, _dir) = test_app_with_fallback(&claude, "test-key", &router);
+    let doc_id = upload(&app, 1).await;
+    let events = ask(&app, &doc_id).await;
+    let (event, data) = events.last().unwrap();
+    assert_eq!(event, "error");
+    let message = data["message"].as_str().unwrap();
+    assert!(
+        message.contains("Rate limited") && message.contains("OpenRouter account is out of credit"),
+        "{message}"
+    );
+    assert_eq!(router_rec.lock().unwrap().len(), 1, "402 is not retried");
+    let (_, conv) = get_json(&app, &format!("/api/documents/{doc_id}/conversation")).await;
+    assert_eq!(conv["turns"], json!([]));
+}
+
+#[tokio::test]
+async fn openrouter_mid_stream_error_is_reported() {
+    let (claude, _) = mock_claude_with_headers(|_| rate_limited()).await;
+    let stream = format!(
+        "data: {}\n\ndata: {}\n\n",
+        json!({"model": "google/gemini-test", "choices": [{"index": 0, "delta": {"content": "Part"}, "finish_reason": null}]}),
+        json!({"model": "google/gemini-test", "error": {"code": 502, "message": "provider down"}, "choices": [{"index": 0, "delta": {"content": ""}, "finish_reason": "error"}]}),
+    );
+    let (router, _) =
+        mock_openrouter(move |_| (StatusCode::OK, "text/event-stream", stream.clone())).await;
+    let (app, _dir) = test_app_with_fallback(&claude, "test-key", &router);
+    let doc_id = upload(&app, 1).await;
+    let events = ask(&app, &doc_id).await;
+    let (event, data) = events.last().unwrap();
+    assert_eq!(event, "error");
+    assert!(data["message"].as_str().unwrap().contains("provider down"));
+}

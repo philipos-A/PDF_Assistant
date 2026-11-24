@@ -34,6 +34,8 @@ export interface Health {
   status: string;
   model: string;
   api_key_configured: boolean;
+  /** An OpenRouter key is set, so other models can answer when Claude is unavailable. */
+  fallback_configured: boolean;
   max_upload_mb: number;
   max_pages: number;
 }
@@ -61,6 +63,8 @@ export interface ChatMessage {
   error?: string;
   /** Set when a fallback model answered instead of the configured one. */
   usedFallback?: boolean;
+  /** Answers: the model that wrote it, e.g. "claude-sonnet-5-5" or "google/gemini-4-hydrogen". */
+  model?: string;
   /** Answers: the passages its `[n](#cite-n)` markers point to. */
   citations?: Citation[];
 }

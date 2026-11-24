@@ -17,8 +17,15 @@ async fn main() {
             std::process::exit(1);
         }
     };
+    if settings.fallback_configured() {
+        tracing::info!(models = ?settings.openrouter_models, "OpenRouter fallback is on");
+    }
     if !settings.api_key_configured() {
-        tracing::warn!("ANTHROPIC_API_KEY is not set; /api/chat will return 503 until it is");
+        if settings.fallback_configured() {
+            tracing::warn!("ANTHROPIC_API_KEY is not set; every answer will come from OpenRouter");
+        } else {
+            tracing::warn!("ANTHROPIC_API_KEY is not set; /api/chat will return 503 until it is");
+        }
     }
 
     let addr = format!("{}:{}", settings.host, settings.port);

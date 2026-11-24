@@ -67,7 +67,7 @@ pub fn normalize_history(history: Vec<Turn>) -> Vec<Turn> {
 
 impl Turn {
     /// The text Claude sees for a user turn: reader context, then the question.
-    fn user_text(&self, page_count: Option<usize>) -> String {
+    pub(crate) fn user_text(&self, page_count: Option<usize>) -> String {
         match &self.context {
             None => self.content.clone(),
             Some(ctx) => format!("{}\n\n{}", ctx.render(page_count), self.content),
@@ -192,11 +192,22 @@ fn page_citation(v: &Value, citations: &mut Vec<Citation>) -> Option<(Citation, 
         .and_then(Value::as_u64)
         .and_then(|e| u32::try_from(e).ok())
         .map_or(start_page, |e| e.saturating_sub(1).max(start_page));
+    Some(number_citation(citations, cited_text, start_page, end_page))
+}
+
+/// Number a cited passage, reusing the number of an identical passage already cited.
+/// Returns the Citation and whether it is new.
+pub(crate) fn number_citation(
+    citations: &mut Vec<Citation>,
+    cited_text: String,
+    start_page: u32,
+    end_page: u32,
+) -> (Citation, bool) {
     if let Some(existing) = citations
         .iter()
         .find(|x| x.cited_text == cited_text && x.start_page == start_page)
     {
-        return Some((existing.clone(), false));
+        return (existing.clone(), false);
     }
     let citation = Citation {
         n: citations.len() + 1,
@@ -205,7 +216,7 @@ fn page_citation(v: &Value, citations: &mut Vec<Citation>) -> Option<(Citation, 
         end_page,
     };
     citations.push(citation.clone());
-    Some((citation, true))
+    (citation, true)
 }
 
 /// The JSON body sent to `POST /v1/messages`.
@@ -241,8 +252,20 @@ impl OutEvent {
     pub fn new(event: &'static str, data: Value) -> Self {
         Self { event, data }
     }
-    fn error(message: impl Into<String>) -> Self {
+    pub(crate) fn error(message: impl Into<String>) -> Self {
         Self::new("error", json!({"message": message.into()}))
+    }
+    /// An error meaning Claude can't serve right now (rate limited, out of credit,
+    /// overloaded or unreachable), sent before any of the Answer. The chat route
+    /// answers with the OpenRouter fallback instead, when one is configured.
+    fn unavailable(message: impl Into<String>) -> Self {
+        Self::new(
+            "error",
+            json!({"message": message.into(), "unavailable": true}),
+        )
+    }
+    pub fn is_unavailable(&self) -> bool {
+        self.event == "error" && self.data["unavailable"] == true
     }
 }
 
@@ -268,6 +291,7 @@ fn status_error(settings: &Settings, status: StatusCode, body: &str) -> String {
         401 => {
             "The Anthropic API key was rejected. Check ANTHROPIC_API_KEY in backend/.env.".into()
         }
+        402 => "Your Anthropic account is out of credit.".into(),
         403 => "This API key does not have access to the configured model.".into(),
         404 => format!(
             "Model '{}' was not found. Check CLAUDE_MODEL in backend/.env.",
@@ -284,6 +308,18 @@ fn retryable(status: StatusCode) -> bool {
     matches!(status.as_u16(), 408 | 409 | 429 | 500..=599)
 }
 
+/// Statuses meaning Claude can't serve this request now, whatever is asked: usage or
+/// credit has run out, or the service is overloaded or down. A 400 counts when it
+/// says the credit balance is too low.
+fn usage_unavailable(status: StatusCode, body: &str) -> bool {
+    match status.as_u16() {
+        402 | 408 | 429 | 500..=599 => true,
+        400 => api_error_message(body)
+            .is_some_and(|m| m.to_ascii_lowercase().contains("credit balance")),
+        _ => false,
+    }
+}
+
 /// Stream `error` types that mean "try again", when no text has streamed yet.
 fn retryable_stream_error(kind: &str) -> bool {
     matches!(kind, "overloaded_error" | "api_error" | "rate_limit_error")
@@ -292,7 +328,7 @@ fn retryable_stream_error(kind: &str) -> bool {
 /// Longest server-requested wait the reader sits through; anything longer fails at once.
 const MAX_RETRY_AFTER: Duration = Duration::from_secs(10);
 
-fn backoff(attempt: u32) -> Duration {
+pub(crate) fn backoff(attempt: u32) -> Duration {
     Duration::from_millis(500 * 2u64.pow(attempt))
 }
 
@@ -315,6 +351,8 @@ fn retry_after(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
 enum Failure {
     Retry(Duration),
     FileMissing,
+    /// Claude can't serve right now (see `usage_unavailable`).
+    Unavailable(String),
     Fatal(String),
 }
 
@@ -448,7 +486,11 @@ async fn send_once(
             if file_missing(status, &text) {
                 return Err(Failure::FileMissing);
             }
-            Err(Failure::Fatal(status_error(settings, status, &text)))
+            let message = status_error(settings, status, &text);
+            if usage_unavailable(status, &text) {
+                return Err(Failure::Unavailable(message));
+            }
+            Err(Failure::Fatal(message))
         }
         Err(e) if (e.is_connect() || e.is_timeout()) && attempt < MAX_RETRIES => {
             tracing::warn!(error = %e, "retrying Anthropic request after connection error");
@@ -456,7 +498,7 @@ async fn send_once(
         }
         Err(e) => {
             tracing::warn!(error = %e, "could not reach Anthropic");
-            Err(Failure::Fatal(
+            Err(Failure::Unavailable(
                 "Could not reach the Anthropic API. Check your network connection.".into(),
             ))
         }
@@ -492,7 +534,7 @@ impl Usage {
 }
 
 /// Split a byte stream into SSE frames and yield each frame's (event, data).
-fn sse_frames(
+pub(crate) fn sse_frames(
     bytes: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Unpin,
 ) -> impl Stream<Item = Result<(String, String), reqwest::Error>> {
     async_stream::try_stream! {
@@ -580,6 +622,10 @@ pub fn stream_answer(
                     yield OutEvent::new("file_missing", json!({}));
                     return;
                 }
+                Err(Failure::Unavailable(message)) => {
+                    yield OutEvent::unavailable(message);
+                    return;
+                }
                 Err(Failure::Fatal(message)) => {
                     yield OutEvent::error(message);
                     return;
@@ -603,7 +649,8 @@ pub fn stream_answer(
                     Ok(f) => f,
                     Err(e) => {
                         tracing::warn!(error = %e, "stream interrupted");
-                        yield OutEvent::error("The connection to Claude was interrupted.");
+                        let message = "The connection to Claude was interrupted.";
+                        yield if sent_text { OutEvent::error(message) } else { OutEvent::unavailable(message) };
                         return;
                     }
                 };
@@ -671,11 +718,16 @@ pub fn stream_answer(
                             continue 'attempt;
                         }
                         let msg = v.pointer("/error/message").and_then(Value::as_str).unwrap_or("unknown error");
-                        yield OutEvent::error(if kind == "overloaded_error" {
+                        let message = if kind == "overloaded_error" {
                             OVERLOADED.to_string()
                         } else {
                             format!("Claude returned an error: {msg}")
-                        });
+                        };
+                        yield if !sent_text && retryable_stream_error(kind) {
+                            OutEvent::unavailable(message)
+                        } else {
+                            OutEvent::error(message)
+                        };
                         return;
                     }
                     _ => {} // ping, content_block_stop, unknown future events

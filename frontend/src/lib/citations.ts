@@ -40,6 +40,7 @@ export function turnsToMessages(turns: StoredTurn[]): ChatMessage[] {
       page,
       status: "done",
       usedFallback: t.used_fallback || undefined,
+      model: t.model ?? undefined,
       citations: t.citations,
     };
   });

@@ -50,6 +50,18 @@ you can click to jump to, and render math with KaTeX.
 - **Cheap follow-up questions.** Each PDF is uploaded to Claude's Files API once
   and referenced by id, and the document block is prompt-cached, so later
   questions on the same paper reuse the cached copy.
+- **Other models when Claude is unavailable.** If Claude can't answer because
+  its usage or credit has run out, it's rate limited or overloaded, or it can't
+  be reached, the same question goes to other models through
+  [OpenRouter](https://openrouter.ai) (by default a Gemini model, then a GPT
+  model, then a smaller Gemini model, tried in that order by OpenRouter). They
+  get the same instructions, the PDF, the saved conversation and your reader
+  context, and they tag the passages they rely on, so answers still come with
+  citation chips and live highlights. The answer shows which model wrote it
+  ("answered by gemini-…"). This switch happens only before any of the answer has
+  streamed; an answer that fails part-way through still reports an error. Set
+  `OPENROUTER_API_KEY` to turn it on; without an Anthropic key, OpenRouter
+  answers every question.
 
 ## Architecture
 
@@ -113,6 +125,16 @@ you can click to jump to, and render math with KaTeX.
 5. After `done`, the question (with its reader context) and the answer (with its
    citations and the model that wrote it) are saved together. Answers that fail,
    are declined or are stopped are not saved.
+6. If Claude returns an error meaning it can't serve right now (HTTP 402, 408,
+   429, 5xx or a "credit balance is too low" 400, a connection failure, or an
+   overload or rate-limit error in the stream) before any text, and
+   `OPENROUTER_API_KEY` is set, the backend sends a `status: fallback` event and
+   asks OpenRouter instead (`POST /api/v1/chat/completions` with a `models` list,
+   so OpenRouter moves on to the next model if one is down). The PDF goes inline
+   as a base64 `file` part. The system prompt gains one instruction: write
+   `{{cite p=N: exact quote}}` before a sentence that uses a passage. The backend
+   turns each tag into the same `citation` event and `[n](#cite-n)` marker as a
+   Claude citation. If OpenRouter fails too, the error names both reasons.
 
 Anthropic has no official Rust SDK, so the backend calls the Messages API
 directly over HTTP (`anthropic-version: 2026-10-21`) and parses the
@@ -189,6 +211,10 @@ make build                # release backend binary + frontend production build
 
 ## Configuration (`backend/.env`)
 
+Values in `backend/.env` take priority over the same variables set in your shell,
+so a shell set up for Claude Code (for example with `ANTHROPIC_API_KEY=""`) doesn't
+hide the key in `.env`.
+
 | Variable            | Default                                       | Purpose                                                      |
 | ------------------- | --------------------------------------------- | ------------------------------------------------------------ |
 | `ANTHROPIC_API_KEY` | *(required)*                                  | Your API key. Never sent to the browser.                     |
@@ -203,7 +229,10 @@ make build                # release backend binary + frontend production build
 | `STORAGE_DIR`       | `storage`                                     | Where PDFs and `library.db` are kept, relative to `backend/`. |
 | `CORS_ORIGINS`      | `http://localhost:5173,http://127.0.0.1:5173` | Allowed browser origins if you call the API directly.        |
 | `HOST` / `PORT`     | `127.0.0.1` / `8000`                          | Address the backend listens on.                              |
-| `ANTHROPIC_BASE_URL`| `https://api.anthropic.com`                   | Send requests to a proxy or mock server instead.             |
+| `CLAUDE_API_BASE_URL`| `https://api.anthropic.com`                  | Send Claude requests to a proxy or mock server instead. (Named so a shell's `ANTHROPIC_BASE_URL`, used by Claude Code, doesn't apply here.) |
+| `OPENROUTER_API_KEY` | *(none)*                                     | Turns on the fallback models. Read from `backend/.env` or the shell; `INSERT KEY` counts as unset. |
+| `OPENROUTER_MODELS`  | `google/gemini-4-hydrogen,openai/gpt-6.2-sol,google/gemini-3.8-flash` | Models OpenRouter tries in order. Pick ones that accept PDF input. |
+| `OPENROUTER_BASE_URL`| `https://openrouter.ai/api/v1`               | Send OpenRouter requests elsewhere (tests use a mock).       |
 | `RUST_LOG`          | `info`                                        | Log filter, e.g. `debug`.                                    |
 
 ## Project layout
@@ -272,6 +301,13 @@ frontend/
 - **Files API copies** are deleted when you delete a paper from the library.
   Deleting files from `STORAGE_DIR` by hand leaves the uploaded copy in your
   Anthropic workspace.
+- **Fallback answers** are less tightly grounded than Claude's. Their citations
+  are quotes the model writes itself, not passages the API checks against the
+  PDF, so a highlight may land on the right page but not the exact words, or
+  only on the page. They don't use the Files API or prompt caching, so every
+  question re-sends the whole PDF (billed as input tokens by OpenRouter).
+  Models, prices and PDF support on OpenRouter change often; set
+  `OPENROUTER_MODELS` to choose your own.
 - **Long conversations** are sent in full with every question. Very long ones
   can eventually exceed the model's context window; **Clear** starts afresh.
 
